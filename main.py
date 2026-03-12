@@ -51,6 +51,7 @@ from visualization import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROJECT_OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DETAIL_LEVEL = "core"
 
 
 def _make_output_layout(root_dir):
@@ -164,6 +165,7 @@ def _build_inertia_identifier(inertia_estimator_cfg, initial_J_diag, initial_q):
             max_inertia=cfg.get('max_inertia', 5.0),
             min_accel_excitation=cfg.get('min_accel_excitation', 1e-3),
             min_torque_excitation=cfg.get('min_torque_excitation', 1e-3),
+            max_update_step=cfg.get('max_update_step', 5e-3),
         )
         return scheme, estimator
 
@@ -184,12 +186,15 @@ def _build_inertia_identifier(inertia_estimator_cfg, initial_J_diag, initial_q):
     raise ValueError("inertia_estimator_cfg['scheme'] 仅支持 'RLS' 或 'MEKF'")
 
 
-def _sync_inertia_estimate(J_diag, sc, adrc_controller):
+def _sync_inertia_estimate(J_diag, adrc_controller):
     """
-    将最新惯量估计同步给动力学模型与 ADRC 控制器。
+    将最新惯量估计同步给控制器内部模型。
+
+    注意:
+        真实动力学模型在仿真中应保持固定，不能把在线辨识结果直接写回“被控对象”，
+        否则会把参数辨识问题变成“边辨识边修改真实系统”，导致结果失真。
     """
     J_diag = ensure_diag_inertia(J_diag)
-    sc.update_inertia(J_diag)
     if adrc_controller is not None:
         adrc_controller.update_b0(1.0 / np.maximum(J_diag, 1e-6))
     return J_diag
@@ -289,7 +294,7 @@ def _assemble_simulation_results(history, dist_const, settle_time, sat_count, um
     return results
 
 
-def _build_simulation_figures(results, umax, controller_kind):
+def _build_simulation_figures(results, umax, controller_kind, detail_level='core'):
     """
     构建单次仿真的完整图像集合，便于显示或批量保存。
     """
@@ -306,51 +311,59 @@ def _build_simulation_figures(results, umax, controller_kind):
     bias_est_hist = results['gyro_bias_est']
 
     figures = {
-        'attitude_estimation.png': plot_attitude_estimation(
-            t_hist,
-            q_true_hist,
-            q_est_hist,
-            f'{controller_name} | MEKF姿态估计结果',
-        ),
         'attitude_error.png': plot_attitude_error(
             t_hist,
             q_true_hist,
             q_est_hist,
             f'{controller_name} | 姿态估计误差',
         ),
-        'control_response.png': plot_control_response(
-            t_hist,
-            results['err'],
-            w_hist,
-            u_hist,
-            umax,
-            f'{controller_name} | 控制系统响应',
-        ),
-        'angular_velocity.png': plot_angular_velocity(
-            t_hist,
-            w_hist,
-            f'{controller_name} | 角速度响应',
-        ),
-        'control_torque.png': plot_control_torque(
-            t_hist,
-            u_hist,
-            umax,
-            f'{controller_name} | 控制力矩',
-        ),
         'simulation_overview.png': plot_simulation_process_overview(
             results,
             title=f'{controller_name} | 闭环仿真过程总览',
         ),
-        'gyro_bias_estimation.png': plot_observer_tracking(
-            t_hist,
-            bias_true_hist,
-            bias_est_hist,
-            title=f'{controller_name} | 陀螺偏置估计对比',
-            ylabel='偏置 (rad/s)',
-            truth_label='真实偏置',
-            estimate_label='MEKF估计偏置',
+        'simulation_report_dashboard.png': plot_simulation_report_dashboard(
+            results,
+            title=f"{controller_tag} 控制器 | 单次仿真综合仪表板",
         ),
     }
+
+    if str(detail_level).lower() == 'full':
+        figures.update({
+            'attitude_estimation.png': plot_attitude_estimation(
+                t_hist,
+                q_true_hist,
+                q_est_hist,
+                f'{controller_name} | MEKF姿态估计结果',
+            ),
+            'control_response.png': plot_control_response(
+                t_hist,
+                results['err'],
+                w_hist,
+                u_hist,
+                umax,
+                f'{controller_name} | 控制系统响应',
+            ),
+            'angular_velocity.png': plot_angular_velocity(
+                t_hist,
+                w_hist,
+                f'{controller_name} | 角速度响应',
+            ),
+            'control_torque.png': plot_control_torque(
+                t_hist,
+                u_hist,
+                umax,
+                f'{controller_name} | 控制力矩',
+            ),
+            'gyro_bias_estimation.png': plot_observer_tracking(
+                t_hist,
+                bias_true_hist,
+                bias_est_hist,
+                title=f'{controller_name} | 陀螺偏置估计对比',
+                ylabel='偏置 (rad/s)',
+                truth_label='真实偏置',
+                estimate_label='MEKF估计偏置',
+            ),
+        })
 
     if controller_tag == 'ADRC':
         figures['disturbance_estimation.png'] = plot_observer_tracking(
@@ -364,13 +377,15 @@ def _build_simulation_figures(results, umax, controller_kind):
         )
 
     if results.get('inertia_estimator_scheme') is not None:
-        figures['inertia_identification.png'] = plot_inertia_identification(
-            results,
-            title=f'{controller_name} | 在线惯量辨识过程',
-        )
         figures['inertia_identification_dashboard.png'] = plot_inertia_identification_dashboard(
             results,
             title=f'{controller_name} | 动力学参数辨识综合图',
+        )
+
+    if str(detail_level).lower() == 'full' and results.get('inertia_estimator_scheme') is not None:
+        figures['inertia_identification.png'] = plot_inertia_identification(
+            results,
+            title=f'{controller_name} | 在线惯量辨识过程',
         )
 
     return figures
@@ -451,20 +466,15 @@ def _save_simulation_data_tables(results, output_dir, controller_kind):
     )
 
 
-def _save_simulation_plot_suite(results, output_dir, controller_kind):
+def _save_simulation_plot_suite(results, output_dir, controller_kind, detail_level='core'):
     """
     保存单次仿真的完整图像集合与数据表。
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    figures = _build_simulation_figures(results, results['u_limit'], controller_kind)
+    figures = _build_simulation_figures(results, results['u_limit'], controller_kind, detail_level=detail_level)
     for filename, fig in figures.items():
         _save_figure(fig, output_dir / filename)
-    report_fig = plot_simulation_report_dashboard(
-        results,
-        title=f"{str(controller_kind).upper()} 控制器 | 单次仿真综合仪表板",
-    )
-    _save_figure(report_fig, output_dir / 'simulation_report_dashboard.png')
     _save_simulation_data_tables(results, output_dir, controller_kind)
 
 
@@ -477,10 +487,10 @@ def _run_inertia_identification_cases(run_profile, umax, output_layout):
     print(f"{'='*70}")
 
     base_cfg = {
-        'T': max(10.0, float(run_profile['T'])),
+        'T': max(12.0, float(run_profile['T'])),
         'dt': float(run_profile['dt']),
         'umax': float(umax),
-        'use_star_tracker': True,
+        'use_star_tracker': False,
         'show_plots': False,
         'seed': 7,
     }
@@ -495,14 +505,17 @@ def _run_inertia_identification_cases(run_profile, umax, output_layout):
         },
         inertia_estimator_cfg={
             'scheme': 'RLS',
-            'J0': np.array([0.05, 0.05, 0.05], dtype=float),
-            'lambda_factor': 0.985,
-            'min_accel_excitation': 5e-4,
-            'min_torque_excitation': 5e-4,
+            'J0': np.array([0.060, 0.060, 0.045], dtype=float),
+            'lambda_factor': 0.995,
+            'min_inertia': 0.02,
+            'max_inertia': 0.12,
+            'min_accel_excitation': 8e-4,
+            'min_torque_excitation': 8e-4,
+            'max_update_step': 8e-4,
         },
         **base_cfg,
     )
-    _save_simulation_plot_suite(rls_results, output_layout['identification_rls'], 'ADRC')
+    _save_simulation_plot_suite(rls_results, output_layout['identification_rls'], 'ADRC', detail_level=OUTPUT_DETAIL_LEVEL)
 
     mekf_results = simulate_attitude_control(
         controller_type='ADRC',
@@ -514,12 +527,14 @@ def _run_inertia_identification_cases(run_profile, umax, output_layout):
         },
         inertia_estimator_cfg={
             'scheme': 'MEKF',
-            'J0': np.array([0.05, 0.05, 0.05], dtype=float),
+            'J0': np.array([0.060, 0.060, 0.045], dtype=float),
+            'min_inertia': 0.02,
+            'max_inertia': 0.12,
         },
         seed=11,
         **{k: v for k, v in base_cfg.items() if k != 'seed'},
     )
-    _save_simulation_plot_suite(mekf_results, output_layout['identification_mekf'], 'ADRC')
+    _save_simulation_plot_suite(mekf_results, output_layout['identification_mekf'], 'ADRC', detail_level=OUTPUT_DETAIL_LEVEL)
 
     print(f"RLS 辨识结果已保存到: {Path(output_layout['identification_rls']).resolve()}")
     print(f"MEKF 辨识结果已保存到: {Path(output_layout['identification_mekf']).resolve()}")
@@ -653,7 +668,6 @@ def _generate_markdown_report(tuning, results_pd, results_adrc, output_layout, r
     image_blocks = [
         ("优化综合仪表板", output_layout['optimization'] / 'pd_optimizer_report_dashboard.png'),
         ("优化景观图", output_layout['optimization'] / 'pd_optimizer_landscape.png'),
-        ("优化器分布图", output_layout['optimization'] / 'pd_optimizer_score_distribution.png'),
         ("PD 单次仿真综合仪表板", output_layout['simulation_pd'] / 'simulation_report_dashboard.png'),
         ("ADRC 单次仿真综合仪表板", output_layout['simulation_adrc'] / 'simulation_report_dashboard.png'),
         ("控制器性能对比图", output_layout['comparison'] / 'pd_vs_adrc_comparison.png'),
@@ -799,9 +813,6 @@ def _save_controller_comparison_plots(results_pd, results_adrc, umax, output_dir
     fig = plot_controller_comparison_dashboard(results_pd, results_adrc, umax, title='PD控制器 vs ADRC控制器性能对比')
     _save_figure(fig, output_dir / "pd_vs_adrc_comparison.png")
 
-    fig_phase = plot_phase_portrait(results_pd, results_adrc, title="PD vs ADRC 相平面图（误差角-角速度）")
-    _save_figure(fig_phase, output_dir / "pd_vs_adrc_phase_portrait.png")
-
     fig_overlay = plot_multiple_responses(
         {
             'PD': results_pd,
@@ -821,17 +832,6 @@ def _save_controller_comparison_plots(results_pd, results_adrc, umax, output_dir
         estimate_label='ESO估计扰动',
     )
     _save_figure(fig_dist, output_dir / "adrc_disturbance_estimation.png")
-
-    fig_bias = plot_observer_tracking(
-        results_adrc['t'],
-        results_adrc['gyro_bias_true'],
-        results_adrc['gyro_bias_est'],
-        title='MEKF陀螺偏置估计对比（真实偏置 vs 估计偏置）',
-        ylabel='偏置 (rad/s)',
-        truth_label='真实偏置',
-        estimate_label='MEKF估计偏置',
-    )
-    _save_figure(fig_bias, output_dir / "mekf_gyro_bias_estimation.png")
     _save_controller_comparison_summary(results_pd, results_adrc, output_dir)
     print(f"图像已保存到: {output_dir.resolve()}")
 
@@ -917,6 +917,7 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
     sat_count = 0
     u_prev = np.zeros(3)  # 用于ADRC的上一时刻控制量
     w_filt_prev = None
+    current_J_diag = initial_J_diag.copy()
 
     # 外部扰动：常值项 + 小幅随机噪声
     # 常值项用于体现 ADRC 对偏置扰动（如重力梯度/气动不平衡）的抑制能力
@@ -985,9 +986,9 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
                 u=u_prev,
                 disturbance_torque=dist_torque_est,
             )
-            current_J_diag = _sync_inertia_estimate(J_diag_est, sc, adrc_controller)
+            current_J_diag = _sync_inertia_estimate(J_diag_est, adrc_controller)
         elif inertia_scheme == 'MEKF' and use_augmented_mekf:
-            current_J_diag = _sync_inertia_estimate(mekf.get_inertia_diag(), sc, adrc_controller)
+            current_J_diag = _sync_inertia_estimate(mekf.get_inertia_diag(), adrc_controller)
             inertia_updated = True
         else:
             current_J_diag = np.diag(sc.J).copy()
@@ -1404,47 +1405,12 @@ def compare_pd_gain_optimizers(
             cache_rows,
         )
 
-    # 优化器图像输出（扩展学术版）
+    # 优化器图像输出（核心结果版）
     if (show_plots or save_plots) and len(comparison) > 0:
         if save_plots:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1) 收敛曲线（均值±标准差）
-        fig_conv, ax_conv = plt.subplots(figsize=(11, 6))
-        for row in comparison:
-            method_name = row['method']
-            mdat = method_run_data[method_name]
-            mh = mdat['mean_hist']
-            sh = mdat['std_hist']
-            x = np.arange(len(mh))
-            ax_conv.plot(x, mh, linewidth=2, label=method_name)
-            ax_conv.fill_between(x, mh - sh, mh + sh, alpha=0.15)
-        ax_conv.set_xlabel('Iteration')
-        ax_conv.set_ylabel('Best-so-far objective')
-        ax_conv.set_title(f'优化器收敛曲线对比（均值±标准差, n={run_count}）')
-        ax_conv.grid(True, alpha=0.3)
-        ax_conv.legend(loc='upper right')
-        fig_conv.tight_layout()
-        if save_plots:
-            _save_figure(fig_conv, out_dir / "pd_optimizer_convergence.png")
-        if show_plots:
-            plt.show()
-
-        # 2) Pareto 前沿（稳态时间 vs 控制能量）
-        fig_pareto = plot_pareto_front(comparison, title="Pareto前沿：稳定时间 vs 控制能量")
-        if save_plots:
-            _save_figure(fig_pareto, out_dir / "pd_optimizer_pareto.png")
-        if show_plots:
-            plt.show()
-
-        # 3) 指标热图（标准化多指标）
-        fig_heatmap = plot_gain_metrics_heatmap(comparison, title="不同算法的性能指标对比（标准化）")
-        if save_plots:
-            _save_figure(fig_heatmap, out_dir / "pd_optimizer_metrics_heatmap.png")
-        if show_plots:
-            plt.show()
-
-        # 4) 已评估点构成的参数景观图
+        # 1) 已评估点构成的参数景观图
         fig_landscape = plot_gain_landscape_from_cache(
             cache,
             (float(lo[0]), float(hi[0])),
@@ -1456,27 +1422,7 @@ def compare_pd_gain_optimizers(
         elif fig_landscape is not None:
             plt.close(fig_landscape)
 
-        # 5) 优化器得分分布图
-        fig_distribution = plot_optimizer_score_distribution(
-            method_run_data,
-            title=f'优化器稳健性分布图（重复运行次数 n={run_count}）',
-        )
-        if save_plots:
-            _save_figure(fig_distribution, out_dir / "pd_optimizer_score_distribution.png")
-        elif fig_distribution is not None:
-            plt.close(fig_distribution)
-
-        # 6) 最终参数收敛区域图
-        fig_param = plot_optimizer_parameter_scatter(
-            method_run_data,
-            bounds=(lo, hi),
-            title='优化器参数收敛区域分布（Kp-Kd 平面）',
-        )
-        if save_plots:
-            _save_figure(fig_param, out_dir / "pd_optimizer_parameter_scatter.png")
-        elif fig_param is not None:
-            plt.close(fig_param)
-
+        # 2) 优化综合仪表板
         fig_report = plot_optimizer_report_dashboard(
             cache,
             method_run_data,
@@ -1569,7 +1515,7 @@ def main(profile='full'):
         show_plots=False,
         controller_type='PD'
     )
-    _save_simulation_plot_suite(results_pd, output_layout['simulation_pd'], 'PD')
+    _save_simulation_plot_suite(results_pd, output_layout['simulation_pd'], 'PD', detail_level=OUTPUT_DETAIL_LEVEL)
     print("PD仿真完成！")
     
     # ====== 运行 ADRC 控制器仿真 ======
@@ -1594,7 +1540,7 @@ def main(profile='full'):
         controller_type='ADRC',
         adrc_params=adrc_params
     )
-    _save_simulation_plot_suite(results_adrc, output_layout['simulation_adrc'], 'ADRC')
+    _save_simulation_plot_suite(results_adrc, output_layout['simulation_adrc'], 'ADRC', detail_level=OUTPUT_DETAIL_LEVEL)
     print("ADRC仿真完成！")
 
     identification_results = _run_inertia_identification_cases(run_profile, umax, output_layout)
