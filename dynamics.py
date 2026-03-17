@@ -24,12 +24,24 @@ class Spacecraft:
             self.J = np.asarray(CONFIG['spacecraft']['inertia'], dtype=float)
         else:
             self.J = np.asarray(J, dtype=float)
-        # 预计算惯量逆矩阵，避免RK4内部重复求逆
-        self.J_inv = np.linalg.inv(self.J)
+        self._refresh_inertia_cache()
         if umax is None:
             self.umax = CONFIG['spacecraft']['u_max']
         else:
             self.umax = umax
+
+    def _refresh_inertia_cache(self):
+        """
+        缓存惯量矩阵的常用形式，便于在积分热路径中走快速分支。
+        """
+        self.J_diag = np.diag(self.J).astype(float, copy=True)
+        self._is_diagonal = bool(np.allclose(self.J, np.diag(self.J_diag)))
+        if self._is_diagonal:
+            self.J_inv_diag = 1.0 / np.maximum(self.J_diag, 1e-12)
+            self.J_inv = np.diag(self.J_inv_diag)
+        else:
+            self.J_inv_diag = None
+            self.J_inv = np.linalg.inv(self.J)
 
     def update_inertia(self, new_J):
         """
@@ -51,7 +63,7 @@ class Spacecraft:
             raise ValueError("new_J 必须是长度 3 的向量或 3x3 矩阵")
 
         self.J = J_mat
-        self.J_inv = np.linalg.inv(self.J)
+        self._refresh_inertia_cache()
     
     def step(self, q, w, u, dt, dist=None):
         """
@@ -133,6 +145,22 @@ class Spacecraft:
         返回:
             wdot: 角速度导数
         """
+        if self._is_diagonal:
+            wx, wy, wz = np.asarray(w, dtype=float)
+            Jx, Jy, Jz = self.J_diag
+            torque = np.asarray(u, dtype=float) + np.asarray(dist, dtype=float)
+            cross_x = (Jz - Jy) * wy * wz
+            cross_y = (Jx - Jz) * wx * wz
+            cross_z = (Jy - Jx) * wx * wy
+            return np.array(
+                [
+                    (torque[0] - cross_x) * self.J_inv_diag[0],
+                    (torque[1] - cross_y) * self.J_inv_diag[1],
+                    (torque[2] - cross_z) * self.J_inv_diag[2],
+                ],
+                dtype=float,
+            )
+
         Jw = self.J @ w
         wdot = self.J_inv @ (u - np.cross(w, Jw) + dist)
         return wdot

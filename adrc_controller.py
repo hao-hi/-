@@ -4,9 +4,9 @@
 """
 
 import numpy as np
+import warnings
 
-from controller import quat_error
-from utils import quat_from_omega, quat_mul, quat_norm
+from core_utils import quat_error, quat_from_omega, quat_mul, quat_norm
 
 
 class ADRCController:
@@ -78,9 +78,11 @@ class ADRCController:
         # 欧拉离散安全约束（经验）
         max_omega_o = 0.5 / max(self.dt, 1e-6)
         if self.omega_o > max_omega_o:
-            print(
-                f"警告：omega_o={self.omega_o:.4f} 对于 dt={self.dt}s 过高"
-                f"（omega_o*dt={self.omega_o*self.dt:.4f} > 0.5），已自动降至 {max_omega_o:.4f}"
+            warnings.warn(
+                f"omega_o={self.omega_o:.4f} 对于 dt={self.dt}s 过高"
+                f"（omega_o*dt={self.omega_o*self.dt:.4f} > 0.5），已自动降至 {max_omega_o:.4f}",
+                RuntimeWarning,
+                stacklevel=2,
             )
             self.omega_o = max_omega_o
 

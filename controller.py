@@ -4,7 +4,7 @@
 """
 
 import numpy as np
-from utils import quat_error
+from core_utils import quat_error
 
 
 def pd_torque(qd, q, w, Kp, Kd):

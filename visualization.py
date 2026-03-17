@@ -7,63 +7,89 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib import ticker
-from utils import quat_angle_errors_deg
+from core_utils import quat_angle_errors_deg
 
 # 解决中文和负号显示问题
 matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'sans-serif']
 matplotlib.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif', 'STSong']
 matplotlib.rcParams['axes.unicode_minus'] = False
 matplotlib.rcParams['figure.dpi'] = 120
-matplotlib.rcParams['savefig.dpi'] = 220
-matplotlib.rcParams['axes.titleweight'] = 'bold'
-matplotlib.rcParams['axes.labelsize'] = 11
-matplotlib.rcParams['xtick.labelsize'] = 9.5
-matplotlib.rcParams['ytick.labelsize'] = 9.5
+matplotlib.rcParams['savefig.dpi'] = 260
+matplotlib.rcParams['savefig.facecolor'] = 'white'
+matplotlib.rcParams['axes.titleweight'] = 'semibold'
+matplotlib.rcParams['axes.labelsize'] = 11.5
+matplotlib.rcParams['axes.linewidth'] = 0.9
+matplotlib.rcParams['axes.axisbelow'] = True
+matplotlib.rcParams['xtick.labelsize'] = 9.8
+matplotlib.rcParams['ytick.labelsize'] = 9.8
+matplotlib.rcParams['xtick.direction'] = 'in'
+matplotlib.rcParams['ytick.direction'] = 'in'
+matplotlib.rcParams['xtick.major.size'] = 4.2
+matplotlib.rcParams['ytick.major.size'] = 4.2
+matplotlib.rcParams['xtick.minor.size'] = 2.4
+matplotlib.rcParams['ytick.minor.size'] = 2.4
 matplotlib.rcParams['legend.frameon'] = True
-matplotlib.rcParams['legend.edgecolor'] = '#ccd3db'
+matplotlib.rcParams['legend.edgecolor'] = '#c7d0da'
 matplotlib.rcParams['legend.facecolor'] = 'white'
+matplotlib.rcParams['legend.framealpha'] = 0.94
+matplotlib.rcParams['legend.fancybox'] = False
+matplotlib.rcParams['grid.alpha'] = 0.85
 
 
 PLOT_COLORS = {
-    'pd': '#1f5aa6',
-    'adrc': '#d1495b',
-    'truth': '#1f1f1f',
-    'estimate': '#2a9d8f',
-    'x': '#e76f51',
-    'y': '#2a9d8f',
-    'z': '#457b9d',
-    'grid': '#d9dde3',
-    'limit': '#7a7a7a',
-    'accent': '#f4a261',
-    'success': '#5b8c5a',
-    'warning': '#f77f00',
-    'soft_fill': '#edf2f7',
+    'pd': '#1f4e79',
+    'adrc': '#b64a4a',
+    'truth': '#1f252d',
+    'estimate': '#2e7d6f',
+    'x': '#c35a49',
+    'y': '#2f8b7c',
+    'z': '#4f6d8a',
+    'grid': '#d9dfe7',
+    'limit': '#7a8087',
+    'accent': '#c98a38',
+    'success': '#5f8d57',
+    'warning': '#cc6f2c',
+    'soft_fill': '#eef3f8',
 }
+_TRAPEZOID = getattr(np, "trapezoid", np.trapz)
+
+
+def _curve_integral(y, x):
+    """统一的梯形积分兼容层。"""
+    return float(_TRAPEZOID(y, x))
 
 
 def _style_axes(ax, xlabel=None, ylabel=None, title=None):
     """统一坐标轴样式。"""
-    ax.set_facecolor('#fbfcfe')
-    ax.grid(True, color=PLOT_COLORS['grid'], linewidth=0.75, alpha=0.75)
+    ax.set_facecolor('#fcfdff')
+    ax.grid(True, color=PLOT_COLORS['grid'], linewidth=0.82, alpha=0.82)
+    ax.minorticks_on()
+    ax.grid(which='minor', color=PLOT_COLORS['grid'], linewidth=0.45, alpha=0.38)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_color('#8c98a4')
-    ax.spines['bottom'].set_color('#8c98a4')
-    ax.tick_params(colors='#39424e')
+    ax.spines['left'].set_color('#8e98a5')
+    ax.spines['bottom'].set_color('#8e98a5')
+    ax.spines['left'].set_linewidth(0.95)
+    ax.spines['bottom'].set_linewidth(0.95)
+    ax.tick_params(colors='#33404d', which='major', width=0.85)
+    ax.tick_params(colors='#66717d', which='minor', width=0.55)
     if xlabel is not None:
         ax.set_xlabel(xlabel)
     if ylabel is not None:
         ax.set_ylabel(ylabel)
     if title is not None:
-        ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
+        ax.set_title(title, fontsize=13.2, fontweight='semibold', pad=11, color='#1f2a36')
 
 
 def _finish_figure(fig, title=None):
     """统一图像收尾。"""
     fig.patch.set_facecolor('white')
     if title:
-        fig.suptitle(title, fontsize=15, fontweight='bold', y=0.995)
-    fig.tight_layout()
+        fig.suptitle(title, fontsize=15.8, fontweight='semibold', y=0.992, color='#17212b')
+        fig.tight_layout(rect=(0, 0, 1, 0.975))
+    else:
+        fig.tight_layout()
+    fig.align_ylabels()
     return fig
 
 
@@ -76,10 +102,10 @@ def _panel_label(ax, label):
         transform=ax.transAxes,
         ha='left',
         va='bottom',
-        fontsize=11,
-        fontweight='bold',
-        color='#243447',
-        bbox=dict(boxstyle='round,pad=0.24', facecolor='white', edgecolor='#cfd8e3', alpha=0.95),
+        fontsize=10.8,
+        fontweight='semibold',
+        color='#223243',
+        bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='#c7d0da', alpha=0.97),
     )
 
 
@@ -102,9 +128,10 @@ def _metric_box(ax, lines, loc='upper right'):
         transform=ax.transAxes,
         ha=ha,
         va=va,
-        fontsize=8.8,
+        fontsize=8.9,
         color='#243447',
-        bbox=dict(boxstyle='round,pad=0.32', facecolor='white', edgecolor='#cfd8e3', alpha=0.92),
+        linespacing=1.35,
+        bbox=dict(boxstyle='round,pad=0.34', facecolor='white', edgecolor='#c7d0da', alpha=0.95),
     )
 
 
@@ -136,6 +163,39 @@ def _annotate_series_end(ax, x, y, text, color):
         color=color,
         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor=color, alpha=0.85),
     )
+
+
+def _highlight_active_spans(ax, t_hist, mask, color, alpha=0.08, min_width=0.0):
+    """
+    将更新/激活区间以纵向浅色带标出，增强时域图的叙事性。
+    """
+    t_arr = np.asarray(t_hist, dtype=float)
+    mask_arr = np.asarray(mask, dtype=float).reshape(-1) > 0.5
+    if t_arr.size == 0 or mask_arr.size != t_arr.size or not np.any(mask_arr):
+        return
+
+    starts = []
+    ends = []
+    in_span = False
+    start_idx = 0
+    for idx, active in enumerate(mask_arr):
+        if active and not in_span:
+            in_span = True
+            start_idx = idx
+        elif not active and in_span:
+            in_span = False
+            starts.append(start_idx)
+            ends.append(idx - 1)
+    if in_span:
+        starts.append(start_idx)
+        ends.append(t_arr.size - 1)
+
+    for s_idx, e_idx in zip(starts, ends):
+        x0 = float(t_arr[s_idx])
+        x1 = float(t_arr[e_idx])
+        if x1 - x0 < min_width and e_idx + 1 < t_arr.size:
+            x1 = float(t_arr[e_idx + 1])
+        ax.axvspan(x0, x1, color=color, alpha=alpha, linewidth=0.0, zorder=0)
 
 
 def plot_attitude_estimation(t_hist, q_true_seq, q_est_seq, title="姿态估计结果"):
@@ -260,7 +320,7 @@ def plot_control_torque(t_hist, u_hist, umax=None, title="控制力矩"):
     _apply_time_axis(axs[3], t_hist)
     _panel_label(axs[3], '(d)')
     _annotate_series_end(axs[3], t_hist[-1], u_norm[-1], f"{u_norm[-1]:.3f}", PLOT_COLORS['truth'])
-    _metric_box(axs[3], [f'积分能耗 = {np.trapz(u_norm, t_hist):.3f} N·m·s'], loc='upper right')
+    _metric_box(axs[3], [f'积分能耗 = {_curve_integral(u_norm, t_hist):.3f} N·m·s'], loc='upper right')
     axs[3].legend(loc='upper right')
     return _finish_figure(fig, title)
 
@@ -308,7 +368,7 @@ def plot_control_response(t_hist, err_hist, w_hist, u_hist, umax=None, title="�
     _style_axes(ax3, xlabel='时间 (s)', ylabel='||u|| (N·m)')
     _apply_time_axis(ax3, t_hist)
     _panel_label(ax3, '(c)')
-    _metric_box(ax3, [f'能耗 = {np.trapz(u_norm, t_hist):.3f} N·m·s'], loc='upper right')
+    _metric_box(ax3, [f'能耗 = {_curve_integral(u_norm, t_hist):.3f} N·m·s'], loc='upper right')
     ax3.legend()
     return _finish_figure(fig)
 
@@ -341,67 +401,122 @@ def plot_controller_comparison_dashboard(results_pd, results_adrc, umax, title="
     绘制 PD 与 ADRC 的四联对比图。
     """
     fig, axes = plt.subplots(2, 2, figsize=(14.5, 10.5))
+    t = np.asarray(results_pd['t'], dtype=float)
+    pd_settle = float(results_pd.get('settle_time', t[-1]))
+    adrc_settle = float(results_adrc.get('settle_time', t[-1]))
 
     ax = axes[0, 0]
-    ax.plot(results_pd['t'], results_pd['err'], color=PLOT_COLORS['pd'], linewidth=2.2, label='PD')
-    ax.plot(results_adrc['t'], results_adrc['err'], color=PLOT_COLORS['adrc'], linewidth=2.2, linestyle='--', label='ADRC')
+    err_pd = np.asarray(results_pd['err'], dtype=float)
+    err_adrc = np.asarray(results_adrc['err'], dtype=float)
+    ax.fill_between(t, err_pd, color=PLOT_COLORS['pd'], alpha=0.08)
+    ax.fill_between(t, err_adrc, color=PLOT_COLORS['adrc'], alpha=0.08)
+    ax.plot(t, err_pd, color=PLOT_COLORS['pd'], linewidth=2.35, label='PD')
+    ax.plot(t, err_adrc, color=PLOT_COLORS['adrc'], linewidth=2.35, linestyle='--', label='ADRC')
     ax.axhline(y=1.0, color=PLOT_COLORS['accent'], linestyle=':', alpha=0.9, label='1度误差界')
+    ax.axvline(pd_settle, color=PLOT_COLORS['pd'], linestyle=':', linewidth=1.0, alpha=0.7)
+    ax.axvline(adrc_settle, color=PLOT_COLORS['adrc'], linestyle=':', linewidth=1.0, alpha=0.7)
     _style_axes(ax, xlabel='时间 (s)', ylabel='姿态误差 (度)', title='姿态误差对比')
-    _apply_time_axis(ax, results_pd['t'])
+    _apply_time_axis(ax, t)
     _panel_label(ax, '(a)')
+    _annotate_series_end(ax, t[-1], err_pd[-1], f"{err_pd[-1]:.2f}", PLOT_COLORS['pd'])
+    _annotate_series_end(ax, t[-1], err_adrc[-1], f"{err_adrc[-1]:.2f}", PLOT_COLORS['adrc'])
+    _metric_box(
+        ax,
+        [
+            f'PD: Ts={pd_settle:.2f}s, Final={err_pd[-1]:.2f}deg',
+            f'ADRC: Ts={adrc_settle:.2f}s, Final={err_adrc[-1]:.2f}deg',
+        ],
+        loc='upper right',
+    )
     ax.legend(loc='upper right')
 
     ax = axes[0, 1]
     w_pd_norm = np.rad2deg(np.linalg.norm(results_pd['w'], axis=1))
     w_adrc_norm = np.rad2deg(np.linalg.norm(results_adrc['w'], axis=1))
-    ax.plot(results_pd['t'], w_pd_norm, color=PLOT_COLORS['pd'], linewidth=2.2, label='PD')
-    ax.plot(results_adrc['t'], w_adrc_norm, color=PLOT_COLORS['adrc'], linewidth=2.2, linestyle='--', label='ADRC')
+    ax.fill_between(t, w_pd_norm, color=PLOT_COLORS['pd'], alpha=0.06)
+    ax.fill_between(t, w_adrc_norm, color=PLOT_COLORS['adrc'], alpha=0.06)
+    ax.plot(t, w_pd_norm, color=PLOT_COLORS['pd'], linewidth=2.2, label='PD')
+    ax.plot(t, w_adrc_norm, color=PLOT_COLORS['adrc'], linewidth=2.2, linestyle='--', label='ADRC')
     _style_axes(ax, xlabel='时间 (s)', ylabel='角速度幅值 (deg/s)', title='角速度对比')
-    _apply_time_axis(ax, results_pd['t'])
+    _apply_time_axis(ax, t)
     _panel_label(ax, '(b)')
+    _metric_box(
+        ax,
+        [
+            f'PD 峰值 = {np.max(w_pd_norm):.2f}',
+            f'ADRC 峰值 = {np.max(w_adrc_norm):.2f}',
+        ],
+        loc='upper right',
+    )
     ax.legend(loc='upper right')
 
     ax = axes[1, 0]
     u_pd_norm = np.linalg.norm(results_pd['u'], axis=1)
     u_adrc_norm = np.linalg.norm(results_adrc['u'], axis=1)
-    ax.plot(results_pd['t'], u_pd_norm, color=PLOT_COLORS['pd'], linewidth=2.2, label='PD')
-    ax.plot(results_adrc['t'], u_adrc_norm, color=PLOT_COLORS['adrc'], linewidth=2.2, linestyle='--', label='ADRC')
+    ax.fill_between(t, u_pd_norm, color=PLOT_COLORS['pd'], alpha=0.06)
+    ax.fill_between(t, u_adrc_norm, color=PLOT_COLORS['adrc'], alpha=0.06)
+    ax.plot(t, u_pd_norm, color=PLOT_COLORS['pd'], linewidth=2.2, label='PD')
+    ax.plot(t, u_adrc_norm, color=PLOT_COLORS['adrc'], linewidth=2.2, linestyle='--', label='ADRC')
     ax.axhline(y=umax, color=PLOT_COLORS['limit'], linestyle=':', alpha=0.9, label=f'限制 {umax}')
     _style_axes(ax, xlabel='时间 (s)', ylabel='||u|| (N·m)', title='控制力矩对比')
-    _apply_time_axis(ax, results_pd['t'])
+    _apply_time_axis(ax, t)
     _panel_label(ax, '(c)')
+    _metric_box(
+        ax,
+        [
+            f'PD 能耗 = {results_pd["effort"]:.3f}',
+            f'ADRC 能耗 = {results_adrc["effort"]:.3f}',
+        ],
+        loc='upper right',
+    )
     ax.legend(loc='upper right')
 
     ax = axes[1, 1]
-    metrics = ['调节时间\n(s)', '超调量\n(度)', '稳态误差\n(角分)', '控制能耗\n(mN·m·s)']
+    metrics = ['ITAE\n(deg·s^2)', 'ISU\n(N^2·m^2·s)', '调节时间\n(s)', '超调量\n(度)']
     pd_values_raw = np.array([
+        results_pd['ITAE'],
+        results_pd['ISU'],
         results_pd['settle_time'],
         results_pd['overshoot'],
-        results_pd['final_error'] * 60.0,
-        results_pd['effort'] * 1000.0,
     ], dtype=float)
     adrc_values_raw = np.array([
+        results_adrc['ITAE'],
+        results_adrc['ISU'],
         results_adrc['settle_time'],
         results_adrc['overshoot'],
-        results_adrc['final_error'] * 60.0,
-        results_adrc['effort'] * 1000.0,
     ], dtype=float)
     denom = np.maximum(np.maximum(pd_values_raw, adrc_values_raw), 1e-12)
     x = np.arange(len(metrics))
     width = 0.36
-    ax.bar(x - width / 2, pd_values_raw / denom, width, label='PD', color=PLOT_COLORS['pd'], alpha=0.85)
-    ax.bar(x + width / 2, adrc_values_raw / denom, width, label='ADRC', color=PLOT_COLORS['adrc'], alpha=0.85)
+    pd_norm = pd_values_raw / denom
+    adrc_norm = adrc_values_raw / denom
+    bars_pd = ax.bar(x - width / 2, pd_norm, width, label='PD', color=PLOT_COLORS['pd'], alpha=0.88)
+    bars_adrc = ax.bar(x + width / 2, adrc_norm, width, label='ADRC', color=PLOT_COLORS['adrc'], alpha=0.84)
     for i in range(len(metrics)):
-        ax.text(x[i] - width / 2, min(pd_values_raw[i] / denom[i] + 0.04, 1.12), f'{pd_values_raw[i]:.2f}',
+        ax.text(x[i] - width / 2, min(pd_norm[i] + 0.04, 1.14), f'{pd_values_raw[i]:.2f}',
                 ha='center', va='bottom', fontsize=8, color=PLOT_COLORS['pd'])
-        ax.text(x[i] + width / 2, min(adrc_values_raw[i] / denom[i] + 0.04, 1.12), f'{adrc_values_raw[i]:.2f}',
+        ax.text(x[i] + width / 2, min(adrc_norm[i] + 0.04, 1.14), f'{adrc_values_raw[i]:.2f}',
                 ha='center', va='bottom', fontsize=8, color=PLOT_COLORS['adrc'])
+        ax.plot([x[i] - width / 2, x[i] + width / 2], [max(pd_norm[i], adrc_norm[i]) + 0.015] * 2,
+                color='#7f8b97', linewidth=0.85)
     ax.set_xticks(x)
     ax.set_xticklabels(metrics, fontsize=9)
-    ax.set_ylim(0, 1.15)
+    ax.set_ylim(0, 1.18)
     _style_axes(ax, ylabel='归一化数值 (0~1)', title='性能指标对比')
     _panel_label(ax, '(d)')
     ax.grid(True, axis='y', color=PLOT_COLORS['grid'], linewidth=0.8, alpha=0.8)
+    itae_impr = (results_pd['ITAE'] - results_adrc['ITAE']) / max(results_pd['ITAE'], 1e-12) * 100.0
+    isu_impr = (results_pd['ISU'] - results_adrc['ISU']) / max(results_pd['ISU'], 1e-12) * 100.0
+    settle_impr = (results_pd['settle_time'] - results_adrc['settle_time']) / max(results_pd['settle_time'], 1e-12) * 100.0
+    _metric_box(
+        ax,
+        [
+            f'ITAE 改进 = {itae_impr:+.1f}%',
+            f'ISU 改进 = {isu_impr:+.1f}%',
+            f'调节时间改进 = {settle_impr:+.1f}%',
+        ],
+        loc='upper left',
+    )
     ax.legend(loc='upper right')
 
     return _finish_figure(fig, title)
@@ -461,7 +576,7 @@ def plot_simulation_process_overview(results, title="闭环仿真过程总览", 
     _apply_time_axis(ax, t)
     _panel_label(ax, '(c)')
     _annotate_series_end(ax, t[-1], u_norm[-1], f"{u_norm[-1]:.3f}", PLOT_COLORS['truth'])
-    _metric_box(ax, [f'控制能耗 = {np.trapz(u_norm, t):.3f} N·m·s'], loc='upper right')
+    _metric_box(ax, [f'控制能耗 = {_curve_integral(u_norm, t):.3f} N·m·s'], loc='upper right')
     ax.legend(loc='upper right')
 
     ax = axes[1, 1]
@@ -577,25 +692,37 @@ def plot_inertia_identification_dashboard(results, title="动力学参数辨识�
     wdot_est = np.asarray(results.get('wdot_est', np.zeros((len(t), 3))), dtype=float)
     u_hist = np.asarray(results.get('u', np.zeros((len(t), 3))), dtype=float)
     update_mask = np.asarray(results.get('inertia_update_mask', np.ones_like(t)), dtype=float).reshape(-1)
+    regressor_min_sv = np.asarray(results.get('regressor_min_sv', np.full(len(t), np.nan)), dtype=float).reshape(-1)
+    regressor_min_sv_ref = results.get('regressor_min_sv_reference')
     scheme = str(results.get('inertia_estimator_scheme', 'Unknown'))
 
-    fig, axes = plt.subplots(2, 2, figsize=(14.8, 10.8), sharex='col')
+    fig, axes = plt.subplots(3, 2, figsize=(14.8, 14.2), sharex='col')
     labels = [('Jxx', PLOT_COLORS['x']), ('Jyy', PLOT_COLORS['y']), ('Jzz', PLOT_COLORS['z'])]
+    update_ratio = 100.0 * float(np.mean(update_mask > 0.5)) if update_mask.size == t.size else 0.0
+    err_norm = np.linalg.norm(inertia_err, axis=1)
 
     ax = axes[0, 0]
+    _highlight_active_spans(ax, t, update_mask, PLOT_COLORS['success'], alpha=0.06)
     for idx, (label, color) in enumerate(labels):
-        ax.plot(t, inertia_est[:, idx], color=color, linewidth=2.0, label=f'{label}估计')
+        ax.plot(t, inertia_est[:, idx], color=color, linewidth=2.15, label=f'{label}估计')
         ax.axhline(inertia_ref[idx], color=color, linestyle='--', linewidth=1.0, alpha=0.65)
+        _annotate_series_end(ax, t[-1], inertia_est[-1, idx], f"{inertia_est[-1, idx]:.4f}", color)
     _style_axes(ax, ylabel='惯量 (kg·m^2)', title=f'辨识方案: {scheme}')
     _panel_label(ax, '(a)')
     _apply_time_axis(ax, t)
+    _metric_box(
+        ax,
+        [f'参考惯量 = [{inertia_ref[0]:.3f}, {inertia_ref[1]:.3f}, {inertia_ref[2]:.3f}]'],
+        loc='lower right',
+    )
     ax.legend(loc='upper right', ncol=2)
 
     ax = axes[0, 1]
-    err_norm = np.linalg.norm(inertia_err, axis=1)
+    _highlight_active_spans(ax, t, update_mask, PLOT_COLORS['success'], alpha=0.05)
     for idx, (label, color) in enumerate(labels):
         ax.plot(t, inertia_err[:, idx], color=color, linewidth=1.7, label=f'{label}误差')
-    ax.plot(t, err_norm, color=PLOT_COLORS['truth'], linewidth=2.0, linestyle='-.', label='误差范数')
+    ax.fill_between(t, err_norm, color=PLOT_COLORS['soft_fill'], alpha=0.45, zorder=0)
+    ax.plot(t, err_norm, color=PLOT_COLORS['truth'], linewidth=2.15, linestyle='-.', label='误差范数')
     ax.axhline(0.0, color='#9aa5b1', linestyle=':', linewidth=0.9)
     _style_axes(ax, ylabel='误差 (kg·m^2)', title='辨识误差收敛')
     _panel_label(ax, '(b)')
@@ -606,23 +733,136 @@ def plot_inertia_identification_dashboard(results, title="动力学参数辨识�
     ax = axes[1, 0]
     torque_norm = np.linalg.norm(u_hist, axis=1)
     accel_norm = np.linalg.norm(wdot_est, axis=1)
+    _highlight_active_spans(ax, t, update_mask, PLOT_COLORS['success'], alpha=0.05)
+    ax.fill_between(t, torque_norm, color=PLOT_COLORS['pd'], alpha=0.05)
+    ax.fill_between(t, accel_norm, color=PLOT_COLORS['adrc'], alpha=0.05)
     ax.plot(t, torque_norm, color=PLOT_COLORS['pd'], linewidth=2.0, label='||u||')
     ax.plot(t, accel_norm, color=PLOT_COLORS['adrc'], linewidth=2.0, label='||dot(omega)_est||')
     _style_axes(ax, xlabel='时间 (s)', ylabel='激励量级', title='辨识所需激励条件')
     _panel_label(ax, '(c)')
     _apply_time_axis(ax, t)
+    _metric_box(
+        ax,
+        [
+            f'平均 ||u|| = {np.mean(torque_norm):.3f}',
+            f'平均 ||dot(omega)|| = {np.mean(accel_norm):.3f}',
+        ],
+        loc='upper right',
+    )
     ax.legend(loc='upper right')
 
     ax = axes[1, 1]
-    if update_mask.size == t.size and np.any(update_mask > 0.5):
-        ax.fill_between(t, 0.0, update_mask, step='mid', color=PLOT_COLORS['success'], alpha=0.35, label='更新激活')
-    ax.plot(t, update_mask, color=PLOT_COLORS['success'], linewidth=1.8)
-    _style_axes(ax, xlabel='时间 (s)', ylabel='更新标记', title='参数更新活跃时段')
+    finite_mask = np.isfinite(regressor_min_sv)
+    _highlight_active_spans(ax, t, update_mask, PLOT_COLORS['success'], alpha=0.05)
+    if np.any(finite_mask):
+        ax.plot(t[finite_mask], regressor_min_sv[finite_mask], color=PLOT_COLORS['accent'], linewidth=2.0, label=r'$\sigma_{\min}(\Phi)$')
+        ax.fill_between(t[finite_mask], regressor_min_sv[finite_mask], color=PLOT_COLORS['accent'], alpha=0.12)
+    else:
+        ax.plot(t, np.zeros_like(t), color=PLOT_COLORS['limit'], linewidth=1.2, linestyle='--', label='PE指标不可用')
+    if regressor_min_sv_ref is not None and np.isfinite(regressor_min_sv_ref):
+        ax.axhline(
+            float(regressor_min_sv_ref),
+            color=PLOT_COLORS['limit'],
+            linestyle='--',
+            linewidth=1.1,
+            label=f'参考阈值 {float(regressor_min_sv_ref):.3f}',
+        )
+    _style_axes(ax, ylabel=r'$\sigma_{\min}(\Phi)$', title='持续激励（PE）诊断')
     _panel_label(ax, '(d)')
     _apply_time_axis(ax, t)
-    ax.set_ylim(-0.05, 1.05)
-    _metric_box(ax, [f'更新占比 = {100.0*np.mean(update_mask > 0.5):.1f}%'])
+    if np.any(finite_mask):
+        _metric_box(
+            ax,
+            [
+                f'均值 = {np.nanmean(regressor_min_sv):.4e}',
+                f'最小值 = {np.nanmin(regressor_min_sv):.4e}',
+            ],
+            loc='upper right',
+        )
     ax.legend(loc='upper right')
+
+    ax = axes[2, 0]
+    update_binary = (update_mask > 0.5).astype(float)
+    dt_local = float(np.median(np.diff(t))) if t.size > 1 else 1.0
+    smooth_window = max(5, int(round(0.75 / max(dt_local, 1e-9))))
+    kernel = np.ones(smooth_window, dtype=float) / smooth_window
+    activity_ratio = 100.0 * np.convolve(update_binary, kernel, mode='same')
+    event_times = t[update_binary > 0.5]
+
+    ax.fill_between(t, 0.0, activity_ratio, color=PLOT_COLORS['success'], alpha=0.18, label='局部更新率')
+    ax.plot(t, activity_ratio, color=PLOT_COLORS['success'], linewidth=2.0)
+    if event_times.size > 0:
+        event_height = max(6.0, 0.12 * np.max(activity_ratio) + 4.0)
+        ax.vlines(event_times, 0.0, event_height, color=PLOT_COLORS['accent'], linewidth=1.1, alpha=0.55, label='更新事件')
+        active_span = f'{event_times[0]:.2f}s - {event_times[-1]:.2f}s'
+    else:
+        active_span = '无有效更新'
+
+    _style_axes(ax, xlabel='时间 (s)', ylabel='局部更新率 (%)', title='参数更新活跃度时间线')
+    _panel_label(ax, '(e)')
+    _apply_time_axis(ax, t)
+    ax.set_ylim(0.0, max(12.0, np.max(activity_ratio) * 1.20 + 2.0))
+    _metric_box(
+        ax,
+        [
+            f'更新占比 = {update_ratio:.1f}%',
+            f'活跃区间 = {active_span}',
+        ],
+    )
+    ax.legend(loc='upper right')
+
+    ax = axes[2, 1]
+    if np.any(finite_mask):
+        active_mask = finite_mask & (update_mask > 0.5)
+        sv_all = regressor_min_sv[finite_mask]
+        err_all = err_norm[finite_mask]
+        sv_active = regressor_min_sv[active_mask]
+        err_active = err_norm[active_mask]
+
+        x_hi = float(np.nanquantile(sv_all, 0.995))
+        x_hi = max(x_hi, float(np.nanmax(sv_all)) * 0.75, 1e-4)
+        x_lo = 0.0
+
+        ax.scatter(
+            sv_all,
+            err_all,
+            s=20,
+            color=PLOT_COLORS['pd'],
+            alpha=0.22,
+            edgecolors='none',
+            label='全时段样本',
+        )
+        if sv_active.size > 0:
+            ax.scatter(
+                sv_active,
+                err_active,
+                s=34,
+                color=PLOT_COLORS['success'],
+                alpha=0.62,
+                edgecolors='white',
+                linewidth=0.4,
+                label='更新活跃样本',
+            )
+            bin_edges = np.linspace(max(x_lo, np.min(sv_active)), max(x_hi, np.max(sv_active)), num=7)
+            trend_x = []
+            trend_y = []
+            for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+                bin_mask = (sv_active >= left) & (sv_active <= right if right == bin_edges[-1] else sv_active < right)
+                if np.any(bin_mask):
+                    trend_x.append(float(np.median(sv_active[bin_mask])))
+                    trend_y.append(float(np.median(err_active[bin_mask])))
+            if len(trend_x) >= 2:
+                ax.plot(trend_x, trend_y, color=PLOT_COLORS['accent'], linewidth=2.0, marker='o', markersize=4, label='活跃样本趋势')
+        ax.set_xlim(x_lo, x_hi * 1.05)
+        corr_val = float(np.corrcoef(sv_all, err_all)[0, 1]) if sv_all.size >= 2 and np.std(sv_all) > 1e-12 and np.std(err_all) > 1e-12 else np.nan
+    _style_axes(ax, xlabel=r'$\sigma_{\min}(\Phi)$', ylabel='误差范数 (kg·m^2)', title='PE 强度与辨识误差关联')
+    _panel_label(ax, '(f)')
+    if np.any(finite_mask):
+        info_lines = [f'样本数 = {int(np.sum(finite_mask))}']
+        if np.isfinite(corr_val):
+            info_lines.append(f'相关系数 = {corr_val:+.2f}')
+        _metric_box(ax, info_lines, loc='upper left')
+        ax.legend(loc='upper right')
 
     return _finish_figure(fig, title)
 
@@ -1265,16 +1505,30 @@ def plot_optimizer_report_dashboard(cache_dict, method_run_data, comparison_resu
             from matplotlib.tri import Triangulation
             try:
                 tri = Triangulation(kp_arr, kd_arr)
-                filled = ax.tricontourf(tri, score_arr, levels=16, cmap='viridis', alpha=0.92)
-                fig.colorbar(filled, ax=ax, fraction=0.046, pad=0.04)
+                filled = ax.tricontourf(tri, score_arr, levels=18, cmap='cividis', alpha=0.94)
+                contour = ax.tricontour(tri, score_arr, levels=8, colors='white', linewidths=0.55, alpha=0.35)
+                ax.clabel(contour, inline=True, fontsize=7, fmt='%.1f')
+                cbar = fig.colorbar(filled, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label('Objective', fontsize=9)
             except Exception:
-                scatter = ax.scatter(kp_arr, kd_arr, c=score_arr, cmap='viridis', s=55, alpha=0.8)
-                fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+                scatter = ax.scatter(kp_arr, kd_arr, c=score_arr, cmap='cividis', s=55, alpha=0.82)
+                cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label('Objective', fontsize=9)
         else:
-            scatter = ax.scatter(kp_arr, kd_arr, c=score_arr, cmap='viridis', s=55, alpha=0.8)
-            fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+            scatter = ax.scatter(kp_arr, kd_arr, c=score_arr, cmap='cividis', s=55, alpha=0.82)
+            cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('Objective', fontsize=9)
+        ax.scatter(kp_arr, kd_arr, color='white', s=9, alpha=0.28, linewidths=0)
         best_idx = int(np.argmin(score_arr))
         ax.scatter([kp_arr[best_idx]], [kd_arr[best_idx]], marker='*', s=320, color=PLOT_COLORS['adrc'], edgecolors='white', linewidth=1.0)
+        _metric_box(
+            ax,
+            [
+                f'已评估点 = {kp_arr.size}',
+                f'最优 = ({kp_arr[best_idx]:.2f}, {kd_arr[best_idx]:.2f})',
+            ],
+            loc='upper left',
+        )
     _style_axes(ax, xlabel='Kp', ylabel='Kd', title='参数景观')
     _panel_label(ax, '(a)')
     ax.set_xlim(bounds[0][0], bounds[1][0])
@@ -1282,13 +1536,23 @@ def plot_optimizer_report_dashboard(cache_dict, method_run_data, comparison_resu
 
     # (b) 收敛
     ax = axes[0, 1]
+    best_method = comparison_results[0]['method'] if comparison_results else None
     for row in comparison_results:
         hist = np.asarray(row.get('history', []), dtype=float)
         if hist.size == 0:
             continue
-        ax.plot(hist, linewidth=2.0, label=row['method'])
+        if row['method'] == best_method:
+            ax.plot(hist, linewidth=2.7, color=PLOT_COLORS['adrc'], label=f"{row['method']} (Best)")
+        else:
+            ax.plot(hist, linewidth=1.65, alpha=0.85, label=row['method'])
     _style_axes(ax, xlabel='迭代步', ylabel='Best-so-far objective', title='优化器收敛曲线')
     _panel_label(ax, '(b)')
+    if comparison_results:
+        _metric_box(
+            ax,
+            [f'最佳算法 = {best_method}', f'最佳 score = {comparison_results[0]["score_best"]:.3f}'],
+            loc='upper right',
+        )
     ax.legend(loc='upper right', fontsize=8.8)
 
     # (c) 目标值分布
@@ -1303,6 +1567,16 @@ def plot_optimizer_report_dashboard(cache_dict, method_run_data, comparison_resu
             body.set_facecolor(color)
             body.set_edgecolor('#2f3b4a')
             body.set_alpha(0.48)
+        ax.boxplot(
+            data,
+            positions=positions,
+            widths=0.20,
+            patch_artist=True,
+            showcaps=True,
+            boxprops=dict(facecolor='white', edgecolor='#415062', linewidth=0.9),
+            whiskerprops=dict(color='#415062', linewidth=0.9),
+            medianprops=dict(color=PLOT_COLORS['truth'], linewidth=1.1),
+        )
         ax.set_xticks(positions)
         ax.set_xticklabels(methods, rotation=8)
     _style_axes(ax, ylabel='风险敏感目标值', title='稳健性分布')
@@ -1318,6 +1592,7 @@ def plot_optimizer_report_dashboard(cache_dict, method_run_data, comparison_resu
         kp_vals = np.asarray([r['Kp'] for r in runs], dtype=float)
         kd_vals = np.asarray([r['Kd'] for r in runs], dtype=float)
         ax.scatter(kp_vals, kd_vals, s=85, color=color, alpha=0.72, edgecolors='white', linewidth=0.6, label=method)
+        ax.scatter(np.mean(kp_vals), np.mean(kd_vals), s=155, marker='X', color=color, edgecolors='#1f252d', linewidth=0.8)
     _style_axes(ax, xlabel='Kp', ylabel='Kd', title='参数收敛区域')
     _panel_label(ax, '(d)')
     ax.set_xlim(bounds[0][0], bounds[1][0])

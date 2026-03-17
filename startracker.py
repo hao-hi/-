@@ -4,8 +4,28 @@
 """
 
 import numpy as np
-from utils import rand_unit, R_to_quat
-from wahba import wahba_attitude
+from core_utils import rand_unit, R_to_quat
+
+
+def wahba_attitude(obs_cam, ref_inertial, w=None):
+    """
+    求解 Wahba 问题：从观测矢量确定姿态旋转矩阵。
+    """
+    assert obs_cam.shape == ref_inertial.shape
+
+    if w is None:
+        w = np.ones(obs_cam.shape[0])
+
+    weighted_obs = obs_cam * np.asarray(w, dtype=float)[:, None]
+    B = weighted_obs.T @ ref_inertial
+
+    U, _, Vt = np.linalg.svd(B)
+
+    M = np.eye(3)
+    if np.linalg.det(U @ Vt) < 0:
+        M[2, 2] = -1
+
+    return U @ M @ Vt
 
 
 class StarTracker:

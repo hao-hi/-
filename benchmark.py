@@ -10,8 +10,9 @@ from main import simulate_attitude_control, compare_pd_gain_optimizers
 
 
 def _time_call(fn, repeats=3):
+    # 先做一次热身，避免首次 JIT / 缓存初始化把基准结果拉歪。
+    last_result = fn()
     samples = []
-    last_result = None
     for _ in range(max(1, int(repeats))):
         start = time.perf_counter()
         last_result = fn()
@@ -37,6 +38,7 @@ def run_benchmarks(repeats=3):
                 show_plots=False,
                 controller_type='PD',
                 seed=0,
+                verbose=False,
             ),
         ),
         (
@@ -48,6 +50,7 @@ def run_benchmarks(repeats=3):
                 show_plots=False,
                 controller_type='ADRC',
                 seed=0,
+                verbose=False,
             ),
         ),
         (
@@ -60,6 +63,7 @@ def run_benchmarks(repeats=3):
                 controller_type='ADRC',
                 seed=0,
                 inertia_estimator_cfg={'scheme': 'RLS', 'lambda_factor': 0.98},
+                verbose=False,
             ),
         ),
         (
@@ -71,6 +75,7 @@ def run_benchmarks(repeats=3):
                 benchmark_runs=1,
                 objective_eval_seeds=[0],
                 quick=True,
+                verbose=False,
             ),
         ),
     ]

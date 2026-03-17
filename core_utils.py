@@ -41,7 +41,10 @@ def quat_inv(q):
 def quat_norm(q):
     """四元数归一化"""
     qf = np.asarray(q, dtype=np.float64)
-    return qf / np.linalg.norm(qf)
+    norm = np.linalg.norm(qf)
+    if norm < 1e-15:
+        return qf.copy()
+    return qf / norm
 
 
 def quat_normalize(q):
@@ -66,7 +69,10 @@ def quat_conjugate(q):
 def quat_from_axis_angle(axis, ang):
     """从轴角表示构造四元数"""
     a = np.asarray(axis, dtype=np.float64)
-    a = a / np.linalg.norm(a)
+    norm = np.linalg.norm(a)
+    if norm < 1e-15:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    a = a / norm
     s = np.sin(ang / 2.0)
     return np.array([np.cos(ang / 2.0), a[0]*s, a[1]*s, a[2]*s])
 
@@ -236,3 +242,10 @@ def quat_angle_errors_deg(q_ref_seq, q_seq):
     dots = np.abs(np.sum(q_ref_norm * q_norm, axis=1))
     dots = np.clip(dots, -1.0, 1.0)
     return np.rad2deg(2.0 * np.arccos(dots))
+
+
+def rand_unit(n):
+    """生成 n 个随机单位向量。"""
+    v = np.random.randn(n, 3)
+    v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
+    return v

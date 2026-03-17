@@ -3,6 +3,8 @@
 包含基于 ESO + RLS 的对角惯量在线辨识器
 """
 
+from collections import deque
+
 import numpy as np
 
 
@@ -97,6 +99,16 @@ class InertiaRLS:
         min_accel_excitation=1e-3,
         min_torque_excitation=1e-3,
         max_update_step=5e-3,
+        min_regressor_norm=1e-3,
+        innovation_clip=0.08,
+        regularization=1e-8,
+        covariance_floor=1e-6,
+        covariance_ceiling=50.0,
+        excitation_alpha=0.10,
+        innovation_deadzone=0.0,
+        min_update_norm=0.0,
+        window_size=8,
+        theta_smoothing=0.60,
     ):
         self.theta = ensure_diag_inertia(J0, min_inertia=min_inertia)
         self.lambda_factor = float(np.clip(lambda_factor, 0.90, 1.0))
@@ -110,10 +122,30 @@ class InertiaRLS:
         self.min_accel_excitation = float(min_accel_excitation)
         self.min_torque_excitation = float(min_torque_excitation)
         self.max_update_step = float(max_update_step)
+        self.min_regressor_norm = float(min_regressor_norm)
+        self.innovation_clip = float(innovation_clip)
+        self.regularization = float(max(0.0, regularization))
+        self.covariance_floor = float(max(1e-12, covariance_floor))
+        self.covariance_ceiling = float(max(self.covariance_floor, covariance_ceiling))
+        self.excitation_alpha = float(np.clip(excitation_alpha, 1e-3, 1.0))
+        self.innovation_deadzone = float(max(0.0, innovation_deadzone))
+        self.min_update_norm = float(max(0.0, min_update_norm))
+        self.window_size = max(1, int(window_size))
+        self.theta_smoothing = float(np.clip(theta_smoothing, 0.05, 1.0))
+        self.accel_level = 0.0
+        self.torque_level = 0.0
+        self.regressor_level = 0.0
+        self.last_regressor_min_sv = 0.0
+        self._phi_window = deque(maxlen=self.window_size)
+        self._y_window = deque(maxlen=self.window_size)
 
     def get_inertia_diag(self):
         """返回当前估计的对角惯量。"""
         return self.theta.copy()
+
+    def get_last_regressor_min_sv(self):
+        """返回最近一次回归矩阵的最小奇异值。"""
+        return float(self.last_regressor_min_sv)
 
     def update(self, omega, wdot, u, disturbance_torque=None):
         """
@@ -137,28 +169,58 @@ class InertiaRLS:
         else:
             disturbance_torque = np.asarray(disturbance_torque, dtype=float)
 
+        Phi = build_inertia_regression_matrix(omega, wdot)
+        y = u + disturbance_torque
+        self._phi_window.append(Phi)
+        self._y_window.append(y)
+
+        Phi_stack = np.vstack(self._phi_window)
+        y_stack = np.concatenate(self._y_window)
+        singular_values = np.linalg.svd(Phi_stack, compute_uv=False)
+        self.last_regressor_min_sv = float(np.min(singular_values)) if singular_values.size else 0.0
+        accel_norm = np.linalg.norm(wdot)
+        torque_norm = np.linalg.norm(y)
+        regressor_norm = np.linalg.norm(Phi_stack, ord='fro')
+        alpha = self.excitation_alpha
+        self.accel_level = (1.0 - alpha) * self.accel_level + alpha * accel_norm
+        self.torque_level = (1.0 - alpha) * self.torque_level + alpha * torque_norm
+        self.regressor_level = (1.0 - alpha) * self.regressor_level + alpha * regressor_norm
+
         if (
-            np.linalg.norm(wdot) < self.min_accel_excitation
-            or np.linalg.norm(u) < self.min_torque_excitation
+            self.accel_level < self.min_accel_excitation
+            or self.torque_level < self.min_torque_excitation
+            or self.regressor_level < self.min_regressor_norm
         ):
             # 激励不足时冻结 theta 与 P，防止协方差风化导致参数漂移。
             return self.theta.copy(), False
 
-        Phi = build_inertia_regression_matrix(omega, wdot)
-        y = u + disturbance_torque
-
-        S = self.lambda_factor * np.eye(3, dtype=float) + Phi @ self.P @ Phi.T
-        PHt = self.P @ Phi.T
+        S = (
+            self.lambda_factor * np.eye(Phi_stack.shape[0], dtype=float)
+            + Phi_stack @ self.P @ Phi_stack.T
+            + self.regularization * np.eye(Phi_stack.shape[0], dtype=float)
+        )
+        PHt = self.P @ Phi_stack.T
         K = np.linalg.solve(S.T, PHt.T).T
-        innovation = y - Phi @ self.theta
+        innovation = y_stack - Phi_stack @ self.theta
+        innovation_norm = np.linalg.norm(innovation)
+        if innovation_norm < self.innovation_deadzone:
+            return self.theta.copy(), False
+        if innovation_norm > self.innovation_clip:
+            innovation = innovation * (self.innovation_clip / (innovation_norm + 1e-12))
 
         delta_theta = K @ innovation
+        if np.linalg.norm(delta_theta) < self.min_update_norm:
+            return self.theta.copy(), False
         delta_theta = np.clip(delta_theta, -self.max_update_step, self.max_update_step)
-        self.theta = self.theta + delta_theta
+        theta_candidate = self.theta + delta_theta
+        self.theta = (1.0 - self.theta_smoothing) * self.theta + self.theta_smoothing * theta_candidate
         self.theta = np.clip(self.theta, self.min_inertia, self.max_inertia)
 
         I3 = np.eye(3, dtype=float)
-        self.P = (I3 - K @ Phi) @ self.P / self.lambda_factor
+        self.P = (I3 - K @ Phi_stack) @ self.P / self.lambda_factor
         self.P = 0.5 * (self.P + self.P.T)
+        eigvals, eigvecs = np.linalg.eigh(self.P)
+        eigvals = np.clip(eigvals, self.covariance_floor, self.covariance_ceiling)
+        self.P = eigvecs @ np.diag(eigvals) @ eigvecs.T
 
         return self.theta.copy(), True
