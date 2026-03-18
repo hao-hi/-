@@ -8,23 +8,33 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import csv
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from config import CONFIG
-from core_utils import quat_from_axis_angle, quat_to_R, quat_mul, jit
+from core_utils import quat_from_axis_angle, quat_to_R, quat_mul, quat_angle_errors_deg, jit
 from dynamics import Spacecraft
 from controller import pd_torque
 from adrc_controller import ADRCController, adrc_torque
 from startracker import StarTracker
 from mekf import MEKFBiasOnly, MEKF_Augmented
 from estimators import InertiaRLS, ensure_diag_inertia
-from 优化器.optimizers import (
-    grid_search,
-    random_search,
-    nelder_mead,
-    simulated_annealing,
-    pso
-)
+try:
+    from 优化器.optimizers import (
+        grid_search,
+        random_search,
+        nelder_mead,
+        simulated_annealing,
+        pso
+    )
+except ModuleNotFoundError:
+    from optimizers import (
+        grid_search,
+        random_search,
+        nelder_mead,
+        simulated_annealing,
+        pso
+    )
 from visualization import (
     plot_attitude_estimation,
     plot_attitude_error,
@@ -37,20 +47,23 @@ from visualization import (
     plot_inertia_identification,
     plot_inertia_identification_dashboard,
     plot_gain_landscape_from_cache,
-    plot_pareto_front,
-    plot_gain_metrics_heatmap,
     plot_optimizer_report_dashboard,
-    plot_optimizer_score_distribution,
-    plot_optimizer_parameter_scatter,
+    plot_optimizer_convergence_statistics,
+    plot_optimizer_best_response_dashboard,
+    plot_optimizer_tradeoff_scatter,
+    plot_optimizer_metric_heatmap,
     plot_multiple_responses,
-    plot_simulation_report_dashboard,
-    plot_phase_portrait
+    plot_simulation_report_dashboard
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROJECT_OUTPUT_DIR = PROJECT_ROOT / "output"
 OUTPUT_DETAIL_LEVEL = "core"
 _TRAPEZOID = getattr(np, "trapezoid", np.trapz)
+IDENTIFICATION_PROBE_PROFILE = {
+    'probe_freqs': [0.32, 0.51, 0.79, 0.46, 0.68, 0.95],
+    'probe_phases': [0.0, 0.9, 1.7, 1.2, 0.4, 2.1],
+}
 
 
 def _make_output_layout(root_dir):
@@ -135,7 +148,105 @@ def _curve_integral(y, x):
     return float(_TRAPEZOID(y, x))
 
 
-def _resolve_excitation_initial_state(rng, T, excitation_profile):
+def _build_augmented_covariance_blocks(P_j_scale, Q_j_scale):
+    """
+    构造增广 MEKF 的初始协方差与过程噪声块矩阵。
+    """
+    P_j_scale = float(P_j_scale)
+    Q_j_scale = float(Q_j_scale)
+    return (
+        np.block([
+            [1e-4 * np.eye(3), np.zeros((3, 3)), np.zeros((3, 3))],
+            [np.zeros((3, 3)), 1e-6 * np.eye(3), np.zeros((3, 3))],
+            [np.zeros((3, 3)), np.zeros((3, 3)), P_j_scale * np.eye(3)],
+        ]),
+        np.block([
+            [1e-7 * np.eye(3), np.zeros((3, 3)), np.zeros((3, 3))],
+            [np.zeros((3, 3)), 1e-10 * np.eye(3), np.zeros((3, 3))],
+            [np.zeros((3, 3)), np.zeros((3, 3)), Q_j_scale * np.eye(3)],
+        ]),
+    )
+
+
+def _with_identification_probe(cfg, probe_amp, probe_duration):
+    """
+    为辨识配置补齐统一的探测力矩参数。
+    """
+    merged = dict(cfg)
+    merged.update(IDENTIFICATION_PROBE_PROFILE)
+    probe_amp_arr = np.asarray(probe_amp, dtype=float).reshape(-1)
+    merged['probe_amp'] = float(probe_amp_arr[0]) if probe_amp_arr.size == 1 else probe_amp_arr[:3].copy()
+    merged['probe_duration'] = float(probe_duration)
+    return merged
+
+
+def _build_identification_case_configs():
+    """
+    统一构造前置惯量辨识案例的 RLS / MEKF 配置。
+    """
+    mekf_P0, mekf_Q = _build_augmented_covariance_blocks(P_j_scale=2.5e-1, Q_j_scale=1.8e-7)
+    rls_cfg = _with_identification_probe(
+        {
+            'scheme': 'RLS',
+            'J0': np.array([1.45, 1.30, 0.95], dtype=float),
+            'lambda_factor': 1.0,
+            'P0': 2.5 * np.eye(3, dtype=float),
+            'min_inertia': 0.50,
+            'max_inertia': 2.40,
+            'min_accel_excitation': 0.008,
+            'min_torque_excitation': 0.012,
+            'max_update_step': 2.5e-2,
+            'min_regressor_norm': 0.005,
+            'innovation_clip': 0.06,
+            'innovation_deadzone': 0.0025,
+            'min_update_norm': 4e-5,
+            'regularization': 1e-6,
+            'covariance_ceiling': 20.0,
+            'excitation_alpha': 0.08,
+            'warmup_time': 1.20,
+            'wdot_filter_alpha': 1.0,
+            'wdot_regression_window': 2,
+            'disturbance_filter_alpha': 0.15,
+            'disturbance_clip': 0.02,
+            'disturbance_enable_time': 2.0,
+            'window_size': 12,
+            'theta_smoothing': 0.90,
+            'filter_alpha': 0.18,
+        },
+        probe_amp=np.array([0.18, 0.20, 0.10], dtype=float),
+        probe_duration=14.0,
+    )
+    mekf_cfg = _with_identification_probe(
+        {
+            'scheme': 'MEKF',
+            'J0': np.array([1.25, 1.15, 0.82], dtype=float),
+            'P0': mekf_P0,
+            'Q': mekf_Q,
+            'min_inertia': 0.50,
+            'max_inertia': 2.40,
+            'min_regressor_norm': 2.5e-3,
+            'max_inertia_step': 8.0e-3,
+            'dynamics_measurement_noise': 0.06,
+            'min_dynamics_excitation': 0.03,
+            'dynamics_innovation_clip': 0.30,
+            'inertia_update_gain': 0.95,
+            'covariance_ceiling': 0.5,
+            'wdot_filter_alpha': 0.65,
+            'wdot_regression_window': 4,
+            'disturbance_filter_alpha': 0.18,
+            'disturbance_clip': 0.03,
+            'disturbance_enable_time': 1.5,
+        },
+        probe_amp=0.16,
+        probe_duration=8.0,
+    )
+    return {
+        'RLS': rls_cfg,
+        'MEKF': mekf_cfg,
+    }
+
+
+def _resolve_excitation_initial_state(rng, T, excitation_profile, rate_scale=1.0):
     """
     统一生成初始姿态与角速度，保证不同仿真路径使用相同的激励规则。
     """
@@ -154,7 +265,7 @@ def _resolve_excitation_initial_state(rng, T, excitation_profile):
         initial_rate_deg = np.array([0.6, -0.6, 0.3], dtype=float)
 
     q0 = quat_from_axis_angle(axis, initial_angle)
-    w0 = np.deg2rad(initial_rate_deg)
+    w0 = np.deg2rad(initial_rate_deg * float(np.clip(rate_scale, 0.5, 8.0)))
     return q0, w0
 
 
@@ -328,6 +439,11 @@ def _build_inertia_identifier(inertia_estimator_cfg, initial_J_diag, initial_q):
             excitation_alpha=cfg.get('excitation_alpha', 0.10),
             innovation_deadzone=cfg.get('innovation_deadzone', 0.0),
             min_update_norm=cfg.get('min_update_norm', 0.0),
+            window_size=cfg.get('window_size', 8),
+            theta_smoothing=cfg.get('theta_smoothing', 0.60),
+            filter_alpha=cfg.get('filter_alpha', 0.15),
+            axis_weight_floor=cfg.get('axis_weight_floor', 0.20),
+            axis_weight_power=cfg.get('axis_weight_power', 0.50),
         )
         return scheme, estimator
 
@@ -375,7 +491,7 @@ def _build_default_adrc_params(dt, estimated_inertia=None, omega_c=4.0, omega_o=
     构造默认 ADRC 参数，并按估计惯量匹配 b0。
     """
     if estimated_inertia is None:
-        estimated_inertia = np.array([0.05, 0.05, 0.05], dtype=float)
+        estimated_inertia = np.array([0.50, 0.50, 0.50], dtype=float)
     else:
         estimated_inertia = ensure_diag_inertia(estimated_inertia)
     return {
@@ -384,6 +500,27 @@ def _build_default_adrc_params(dt, estimated_inertia=None, omega_c=4.0, omega_o=
         'omega_o': float(omega_o),
         'dt': dt,
     }
+
+
+def _init_controller(controller_kind, dt, Kp, Kd, adrc_params=None, verbose=True):
+    """
+    统一初始化控制器实例，并返回解析后的参数。
+    """
+    controller_tag = str(controller_kind).upper()
+    if controller_tag == 'ADRC':
+        resolved_adrc_params = _build_default_adrc_params(dt) if adrc_params is None else dict(adrc_params)
+        controller = ADRCController(**resolved_adrc_params)
+        if verbose:
+            print(
+                f"使用ADRC控制器: "
+                f"omega_c={resolved_adrc_params.get('omega_c', 2.5)}, "
+                f"omega_o={resolved_adrc_params.get('omega_o', 8.0)}"
+            )
+        return controller, resolved_adrc_params
+
+    if verbose:
+        print(f"使用PD控制器: Kp={Kp}, Kd={Kd}")
+    return None, None
 
 
 def _resolve_true_inertia_matrix(true_inertia):
@@ -414,6 +551,57 @@ def _allocate_simulation_history(steps):
         'inertia_update_mask': np.empty(steps, dtype=float),
         'wdot_est': np.empty((steps, 3), dtype=float),
         'regressor_min_sv': np.full(steps, np.nan, dtype=float),
+        'axis_regressor_norms': np.full((steps, 3), np.nan, dtype=float),
+    }
+
+
+def _build_estimation_context(sc, inertia_estimator_cfg, initial_q, dt):
+    """
+    统一初始化 MEKF 与在线惯量辨识相关上下文。
+    """
+    initial_J_diag = np.diag(sc.J).copy()
+    inertia_scheme, inertia_identifier = _build_inertia_identifier(
+        inertia_estimator_cfg,
+        initial_J_diag=initial_J_diag,
+        initial_q=initial_q,
+    )
+    if inertia_scheme == 'MEKF':
+        mekf = inertia_identifier
+    else:
+        mekf = MEKFBiasOnly()
+        mekf.q = initial_q.copy()
+
+    estimator_cfg = {} if inertia_estimator_cfg is None else dict(inertia_estimator_cfg)
+    use_augmented_mekf = isinstance(mekf, MEKF_Augmented)
+    regressor_min_sv_reference = None
+    if inertia_scheme == 'RLS' and inertia_identifier is not None:
+        regressor_min_sv_reference = float(
+            estimator_cfg.get('min_regressor_norm', inertia_identifier.min_regressor_norm)
+        )
+
+    if inertia_scheme == 'RLS' and inertia_identifier is not None:
+        current_J_diag = inertia_identifier.get_inertia_diag()
+    elif inertia_scheme == 'MEKF' and use_augmented_mekf:
+        current_J_diag = mekf.get_inertia_diag()
+    else:
+        current_J_diag = initial_J_diag.copy()
+
+    return {
+        'mekf': mekf,
+        'use_augmented_mekf': use_augmented_mekf,
+        'inertia_scheme': inertia_scheme,
+        'inertia_identifier': inertia_identifier,
+        'inertia_reference': initial_J_diag.copy(),
+        'nominal_J_diag': initial_J_diag.copy(),
+        'current_J_diag': current_J_diag,
+        'estimator_cfg': estimator_cfg,
+        'inertia_warmup_steps': int(max(0.0, float(estimator_cfg.get('warmup_time', 0.0))) / dt),
+        'wdot_filter_alpha': float(np.clip(estimator_cfg.get('wdot_filter_alpha', 1.0), 0.0, 1.0)),
+        'wdot_regression_window': max(2, int(estimator_cfg.get('wdot_regression_window', 2))),
+        'disturbance_filter_alpha': float(np.clip(estimator_cfg.get('disturbance_filter_alpha', 1.0), 0.0, 1.0)),
+        'disturbance_enable_steps': int(max(0.0, float(estimator_cfg.get('disturbance_enable_time', 0.0))) / dt),
+        'disturbance_clip': estimator_cfg.get('disturbance_clip'),
+        'regressor_min_sv_reference': regressor_min_sv_reference,
     }
 
 
@@ -428,22 +616,399 @@ def _apply_quaternion_noise(q, noise_axis, noise_angle):
     return q_noisy / np.linalg.norm(q_noisy)
 
 
+def _compute_identification_probe_torque(t, estimator_cfg, umax):
+    """
+    生成用于参数辨识的轻量多频探测力矩。
+    """
+    if estimator_cfg is None:
+        return np.zeros(3, dtype=float)
+
+    probe_amp = estimator_cfg.get('probe_amp')
+    probe_duration = float(max(0.0, estimator_cfg.get('probe_duration', 0.0)))
+    if probe_amp is None or probe_duration <= 0.0 or t > probe_duration:
+        return np.zeros(3, dtype=float)
+
+    amp_arr = np.asarray(probe_amp, dtype=float).reshape(-1)
+    if amp_arr.size == 1:
+        amp_vec = np.full(3, float(amp_arr[0]), dtype=float)
+    else:
+        amp_vec = np.pad(amp_arr[:3], (0, max(0, 3 - amp_arr[:3].size)), mode='edge').astype(float)
+
+    if np.max(np.abs(amp_vec)) <= 1.0:
+        amp_vec = amp_vec * float(umax)
+
+    freqs = np.asarray(estimator_cfg.get('probe_freqs', [0.35, 0.57, 0.83, 0.48, 0.71, 0.93]), dtype=float).reshape(-1)
+    phases = np.asarray(estimator_cfg.get('probe_phases', [0.0, 0.8, 1.6, 1.1, 0.3, 2.0]), dtype=float).reshape(-1)
+    if freqs.size < 6:
+        freqs = np.pad(freqs, (0, 6 - freqs.size), mode='edge')
+    if phases.size < 6:
+        phases = np.pad(phases, (0, 6 - phases.size), mode='edge')
+
+    ramp_time = max(0.6, 0.15 * probe_duration)
+    ramp = min(1.0, max(0.0, t / ramp_time))
+    primary = np.sin(2.0 * np.pi * freqs[:3] * t + phases[:3])
+    secondary = np.cos(2.0 * np.pi * freqs[3:6] * t + phases[3:6])
+    probe_shape = 0.72 * primary + 0.28 * secondary
+    probe = ramp * amp_vec * probe_shape
+    return probe.astype(float)
+
+
+def _resolve_attitude_measurement(
+    q,
+    use_star_tracker,
+    star_tracker,
+    step_idx,
+    fallback_noise_axes,
+    fallback_startracker_angles,
+    fallback_ideal_angles,
+):
+    """
+    统一处理星敏感器观测与退化时的噪声姿态测量。
+    """
+    if use_star_tracker and star_tracker is not None:
+        q_meas = star_tracker.observe(quat_to_R(q))
+        if q_meas is not None:
+            return q_meas
+        return _apply_quaternion_noise(q, fallback_noise_axes[step_idx], fallback_startracker_angles[step_idx])
+    return _apply_quaternion_noise(q, fallback_noise_axes[step_idx], fallback_ideal_angles[step_idx])
+
+
+def _estimate_angular_rate_regression_state(w_samples, dt):
+    """
+    使用短窗线性回归同时估计局部平均角速度与角加速度。
+
+    相比简单两点差分，这种做法对陀螺噪声更稳，也更适合在线惯量辨识。
+    """
+    if not w_samples:
+        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
+
+    W = np.vstack(w_samples).astype(float, copy=False)
+    omega_reg = np.mean(W, axis=0)
+    if W.shape[0] < 2:
+        return omega_reg, np.zeros(3, dtype=float)
+
+    idx = np.arange(W.shape[0], dtype=float)
+    idx_center = idx - np.mean(idx)
+    denom = float(np.sum(idx_center ** 2))
+    if denom <= 1e-12:
+        return omega_reg, np.zeros(3, dtype=float)
+
+    slope = (idx_center[:, None] * W).sum(axis=0) / (denom * float(dt))
+    return omega_reg, slope
+
+
 def _compute_settle_time(err_hist, t_hist, strict_threshold=2.0, trans_threshold=3.0):
     """
     采用两阶段规则计算调节时间。
     """
-    settle_time = t_hist[-1] + 10.0
-    stable_window = max(20, int(len(err_hist) * 0.05))
+    err = np.asarray(err_hist, dtype=float)
+    t_arr = np.asarray(t_hist, dtype=float)
+    settle_time = t_arr[-1] + 10.0
+    stable_window = max(20, int(err.size * 0.05))
 
-    for i in range(len(err_hist) - stable_window + 1):
-        if np.all(err_hist[i:i + stable_window] <= strict_threshold):
-            return float(t_hist[i])
+    if err.size >= stable_window:
+        strict_mask = (err <= strict_threshold).astype(np.int8, copy=False)
+        stable_counts = np.convolve(
+            strict_mask,
+            np.ones(stable_window, dtype=np.int16),
+            mode='valid',
+        )
+        stable_idx = np.flatnonzero(stable_counts == stable_window)
+        if stable_idx.size:
+            return float(t_arr[int(stable_idx[0])])
 
-    for i in range(len(err_hist) - 1, -1, -1):
-        if err_hist[i] > trans_threshold:
-            return float(t_hist[i] + 1.0)
+    trans_idx = np.flatnonzero(err > trans_threshold)
+    if trans_idx.size:
+        return float(t_arr[int(trans_idx[-1])] + 1.0)
 
     return float(settle_time)
+
+
+def _compute_overshoot(err_hist):
+    """
+    计算姿态误差调节过程中的超调量。
+
+    当前误差定义为“姿态角误差模值”，且仿真从非零初始误差收敛到零。
+    因此超调不应把初始误差本身计入，而应只统计控制启动后
+    是否出现“超过初始误差峰值”的二次抬升。
+    """
+    err = np.asarray(err_hist, dtype=float).reshape(-1)
+    if err.size == 0:
+        return 0.0
+    if err.size == 1:
+        return 0.0
+
+    initial_error = float(err[0])
+    peak_after_start = float(np.max(err[1:]))
+    return float(max(0.0, peak_after_start - initial_error))
+
+
+def _tail_window_slice(length, tail_ratio=0.15, min_samples=8):
+    """
+    返回结果尾段切片，用于稳态统计。
+    """
+    n = int(max(0, length))
+    if n <= 0:
+        return slice(0, 0)
+    window = max(int(min_samples), int(np.ceil(n * float(tail_ratio))))
+    window = min(n, max(1, window))
+    return slice(n - window, n)
+
+
+def _resolve_disturbance_torque_estimate(
+    step_idx,
+    inertia_scheme,
+    inertia_identifier,
+    adrc_controller,
+    disturbance_filter_alpha,
+    disturbance_clip,
+    disturbance_enable_steps,
+    dist_torque_filt_prev,
+):
+    """
+    统一计算供在线辨识使用的扰动力矩估计。
+    """
+    if inertia_identifier is None or inertia_scheme not in {'RLS', 'MEKF'}:
+        return np.zeros(3, dtype=float), dist_torque_filt_prev
+
+    dist_torque_raw = (
+        adrc_controller.get_disturbance_estimate_torque()
+        if adrc_controller is not None else np.zeros(3, dtype=float)
+    )
+    dist_torque_est = _blend_vector(dist_torque_filt_prev, dist_torque_raw, disturbance_filter_alpha)
+    next_prev = dist_torque_est.copy()
+
+    if disturbance_clip is not None:
+        dist_norm = np.linalg.norm(dist_torque_est)
+        dist_limit = float(max(0.0, disturbance_clip))
+        if dist_norm > dist_limit > 0.0:
+            dist_torque_est = dist_torque_est * (dist_limit / (dist_norm + 1e-12))
+    if step_idx < disturbance_enable_steps:
+        dist_torque_est = np.zeros(3, dtype=float)
+
+    return dist_torque_est, next_prev
+
+
+def _update_inertia_estimation(
+    step_idx,
+    inertia_scheme,
+    inertia_identifier,
+    use_augmented_mekf,
+    mekf,
+    inertia_warmup_steps,
+    omega_id,
+    wdot_est,
+    u_prev,
+    dist_torque_est,
+    nominal_J_diag,
+    adrc_controller,
+):
+    """
+    统一处理 RLS / 增广 MEKF 的惯量更新与诊断量输出。
+    """
+    if inertia_scheme == 'RLS' and inertia_identifier is not None and step_idx >= inertia_warmup_steps:
+        J_diag_est, inertia_updated = inertia_identifier.update(
+            omega=omega_id,
+            wdot=wdot_est,
+            u=u_prev,
+            disturbance_torque=dist_torque_est,
+        )
+        return (
+            _sync_inertia_estimate(J_diag_est, adrc_controller),
+            inertia_updated,
+            inertia_identifier.get_last_regressor_min_sv(),
+            inertia_identifier.get_last_axis_regressor_norms(),
+        )
+
+    if inertia_scheme == 'RLS' and inertia_identifier is not None:
+        return (
+            _sync_inertia_estimate(inertia_identifier.get_inertia_diag(), adrc_controller),
+            False,
+            inertia_identifier.get_last_regressor_min_sv(),
+            inertia_identifier.get_last_axis_regressor_norms(),
+        )
+
+    if inertia_scheme == 'MEKF' and use_augmented_mekf:
+        inertia_updated = (
+            mekf.update_dynamics(wdot_est, disturbance_torque=dist_torque_est)
+            if step_idx >= inertia_warmup_steps else False
+        )
+        return (
+            _sync_inertia_estimate(mekf.get_inertia_diag(), adrc_controller),
+            inertia_updated,
+            np.nan,
+            np.full(3, np.nan, dtype=float),
+        )
+
+    if inertia_scheme == 'MEKF' and inertia_identifier is not None:
+        return (
+            _sync_inertia_estimate(mekf.get_inertia_diag(), adrc_controller),
+            False,
+            np.nan,
+            np.full(3, np.nan, dtype=float),
+        )
+
+    return nominal_J_diag.copy(), False, np.nan, np.full(3, np.nan, dtype=float)
+
+
+def _compute_control_command(controller_kind, qd, q, w, Kp, Kd, adrc_controller, dt, u_prev):
+    """
+    统一计算当前控制输入及其扰动估计输出。
+    """
+    if str(controller_kind).upper() == 'ADRC':
+        u_cmd, _ = adrc_torque(qd, q, w, adrc_controller, dt, u_prev)
+        return u_cmd, adrc_controller.get_disturbance_estimate_torque()
+
+    u_cmd, _ = pd_torque(qd, q, w, Kp, Kd)
+    return u_cmd, np.zeros(3, dtype=float)
+
+
+def _resolve_control_feedback_state(control_feedback_source, q_true, w_true, q_est, w_est):
+    """
+    统一决定控制器使用真实状态还是估计状态闭环。
+    """
+    mode = str(control_feedback_source).strip().lower()
+    if mode == 'estimate':
+        return (
+            np.asarray(q_est, dtype=float).copy(),
+            np.asarray(w_est, dtype=float).copy(),
+            mode,
+        )
+    if mode == 'truth':
+        return (
+            np.asarray(q_true, dtype=float).copy(),
+            np.asarray(w_true, dtype=float).copy(),
+            mode,
+        )
+    raise ValueError("control_feedback_source must be 'truth' or 'estimate'")
+
+
+def _record_simulation_sample(
+    history,
+    step_idx,
+    t,
+    q,
+    q_est,
+    w,
+    u_sat,
+    err_deg,
+    dist_true,
+    dist_est,
+    gyro_bias_true,
+    gyro_bias_est,
+    current_J_diag,
+    inertia_updated,
+    wdot_est,
+    regressor_min_sv,
+    axis_regressor_norms,
+):
+    """
+    将当前时刻的仿真状态统一写入历史数组。
+    """
+    history['t'][step_idx] = t
+    history['q_true'][step_idx] = q
+    history['q_est'][step_idx] = q_est
+    history['w'][step_idx] = w
+    history['u'][step_idx] = u_sat
+    history['err'][step_idx] = err_deg
+    history['dist_true'][step_idx] = dist_true
+    history['dist_est'][step_idx] = dist_est
+    history['gyro_bias_true'][step_idx] = gyro_bias_true
+    history['gyro_bias_est'][step_idx] = gyro_bias_est
+    history['inertia_est'][step_idx] = current_J_diag
+    history['inertia_update_mask'][step_idx] = 1.0 if inertia_updated else 0.0
+    history['wdot_est'][step_idx] = wdot_est
+    history['regressor_min_sv'][step_idx] = regressor_min_sv
+    history['axis_regressor_norms'][step_idx] = axis_regressor_norms
+
+
+def _compute_control_metrics(u_hist, umax):
+    """
+    统一计算控制输入的范数、单轴峰值和限幅利用率指标。
+    """
+    u_arr = np.asarray(u_hist, dtype=float)
+    if u_arr.ndim != 2 or u_arr.shape[1] != 3:
+        raise ValueError("u_hist 必须是 N×3 控制力矩数组")
+
+    if u_arr.shape[0] == 0:
+        return {
+            'u_norm': np.empty(0, dtype=float),
+            'u_axis_peak': np.empty(0, dtype=float),
+            'peak_torque_norm': 0.0,
+            'peak_axis_torque': 0.0,
+            'control_limit_norm': float(np.sqrt(3.0) * float(umax)),
+            'torque_usage_ratio': 0.0,
+        }
+
+    u_norm = np.linalg.norm(u_arr, axis=1)
+    u_axis_peak = np.max(np.abs(u_arr), axis=1)
+    peak_axis_torque = float(np.max(u_axis_peak))
+    return {
+        'u_norm': u_norm,
+        'u_axis_peak': u_axis_peak,
+        'peak_torque_norm': float(np.max(u_norm)),
+        'peak_axis_torque': peak_axis_torque,
+        'control_limit_norm': float(np.sqrt(u_arr.shape[1]) * float(umax)),
+        'torque_usage_ratio': peak_axis_torque / max(float(umax), 1e-12),
+    }
+
+
+def _derive_simulation_metrics(history, settle_time, sat_count, umax):
+    """
+    从仿真历史统一派生结果指标，供表格、报告和图表复用。
+    """
+    err_hist = np.asarray(history['err'], dtype=float)
+    t_hist = np.asarray(history['t'], dtype=float)
+    u_hist = np.asarray(history['u'], dtype=float)
+    w_hist = np.asarray(history['w'], dtype=float)
+    control_metrics = _compute_control_metrics(u_hist, umax)
+
+    overshoot = _compute_overshoot(err_hist)
+    final_error = float(err_hist[-1]) if err_hist.size else 0.0
+    abs_err = np.abs(err_hist)
+    u_norm = control_metrics['u_norm']
+    w_norm_deg = np.rad2deg(np.linalg.norm(w_hist, axis=1))
+    tail_slice = _tail_window_slice(err_hist.size)
+    tail_err = err_hist[tail_slice]
+
+    attitude_est_rmse = np.nan
+    if history.get('q_true') is not None and history.get('q_est') is not None:
+        q_err_deg = quat_angle_errors_deg(history['q_true'], history['q_est'])
+        attitude_est_rmse = float(np.sqrt(np.mean(q_err_deg ** 2)))
+
+    bias_rmse = np.nan
+    if history.get('gyro_bias_true') is not None and history.get('gyro_bias_est') is not None:
+        bias_delta = history['gyro_bias_true'] - history['gyro_bias_est']
+        bias_rmse = float(np.sqrt(np.mean(np.sum(bias_delta ** 2, axis=1))))
+
+    disturbance_rmse = np.nan
+    if history.get('dist_true') is not None and history.get('dist_est') is not None:
+        dist_delta = history['dist_true'] - history['dist_est']
+        disturbance_rmse = float(np.sqrt(np.mean(np.sum(dist_delta ** 2, axis=1))))
+
+    return {
+        'settle_time': float(settle_time),
+        'overshoot': float(overshoot),
+        'final_error': final_error,
+        'peak_error': float(np.max(err_hist)) if err_hist.size else 0.0,
+        'rms_error': float(np.sqrt(np.mean(err_hist ** 2))) if err_hist.size else 0.0,
+        'steady_state_rms': float(np.sqrt(np.mean(tail_err ** 2))) if tail_err.size else final_error,
+        'steady_state_mean': float(np.mean(tail_err)) if tail_err.size else final_error,
+        'effort': _curve_integral(u_norm, t_hist) if t_hist.size else 0.0,
+        'IAE': _curve_integral(abs_err, t_hist) if t_hist.size else 0.0,
+        'ITAE': _curve_integral(t_hist * abs_err, t_hist) if t_hist.size else 0.0,
+        'ISU': _curve_integral(np.sum(u_hist ** 2, axis=1), t_hist) if t_hist.size else 0.0,
+        'peak_rate_deg': float(np.max(w_norm_deg)) if w_norm_deg.size else 0.0,
+        'peak_torque': control_metrics['peak_torque_norm'],
+        'peak_axis_torque': control_metrics['peak_axis_torque'],
+        'peak_torque_norm': control_metrics['peak_torque_norm'],
+        'control_limit_norm': control_metrics['control_limit_norm'],
+        'torque_usage_ratio': control_metrics['torque_usage_ratio'],
+        'sat_ratio': float(sat_count) / max(1, len(t_hist)),
+        'attitude_est_rmse': attitude_est_rmse,
+        'bias_rmse': bias_rmse,
+        'disturbance_rmse': disturbance_rmse,
+    }
 
 
 def _assemble_simulation_results(
@@ -457,41 +1022,22 @@ def _assemble_simulation_results(
     Kp,
     Kd,
     inertia_scheme,
+    control_feedback_source,
     inertia_reference=None,
     regressor_min_sv_reference=None,
 ):
     """
     汇总仿真历史与性能指标。
     """
-    err_hist = history['err']
-    t_hist = history['t']
-    u_hist = history['u']
-
-    overshoot = float(np.max(err_hist) - err_hist[-1])
-    final_error = float(err_hist[-1])
-    u_norm = np.linalg.norm(u_hist, axis=1)
-    abs_err = np.abs(err_hist)
-    effort = _curve_integral(u_norm, t_hist)
-    iae = _curve_integral(abs_err, t_hist)
-    itae = _curve_integral(t_hist * abs_err, t_hist)
-    isu = _curve_integral(np.sum(u_hist ** 2, axis=1), t_hist)
-    sat_ratio = sat_count / len(t_hist)
-
     results = dict(history)
+    results.update(_derive_simulation_metrics(history, settle_time, sat_count, umax))
     results.update({
         'dist_const': dist_const.copy(),
-        'settle_time': settle_time,
-        'overshoot': overshoot,
-        'final_error': final_error,
-        'effort': effort,
-        'IAE': iae,
-        'ITAE': itae,
-        'ISU': isu,
-        'sat_ratio': sat_ratio,
         'inertia_estimator_scheme': inertia_scheme,
         'Kp': Kp if controller_kind == 'PD' else None,
         'Kd': Kd if controller_kind == 'PD' else None,
         'controller_type': controller_type,
+        'control_feedback_source': str(control_feedback_source).strip().lower(),
         'u_limit': float(umax),
         'inertia_reference': None if inertia_reference is None else ensure_diag_inertia(inertia_reference),
         'regressor_min_sv_reference': None if regressor_min_sv_reference is None else float(regressor_min_sv_reference),
@@ -596,7 +1142,7 @@ def _build_simulation_figures(results, umax, controller_kind, detail_level='core
     return figures
 
 
-def _simulate_pd_metrics_only(Kp, Kd, T, dt, umax, noise, seed, excitation_profile, controller_type):
+def _simulate_pd_metrics_only(Kp, Kd, T, dt, umax, noise, seed, excitation_profile, controller_type, true_inertia=None):
     """
     面向 PD 自动调参的轻量仿真路径。
 
@@ -604,7 +1150,10 @@ def _simulate_pd_metrics_only(Kp, Kd, T, dt, umax, noise, seed, excitation_profi
     仅计算目标函数所需的时域指标，显著降低优化器横评的单点评估成本。
     """
     rng = np.random.RandomState(seed)
-    q, w = _resolve_excitation_initial_state(rng, T, excitation_profile)
+    true_inertia_diag = np.diag(_resolve_true_inertia_matrix(true_inertia))
+    nominal_inertia_diag = np.diag(np.asarray(CONFIG['spacecraft']['inertia'], dtype=float))
+    rate_scale = np.sqrt(np.mean(true_inertia_diag) / max(np.mean(nominal_inertia_diag), 1e-12))
+    q, w = _resolve_excitation_initial_state(rng, T, excitation_profile, rate_scale=rate_scale)
     steps = int(T / dt)
 
     # 保持随机数消费顺序与完整仿真一致，使扰动序列可复现实验结果。
@@ -623,7 +1172,7 @@ def _simulate_pd_metrics_only(Kp, Kd, T, dt, umax, noise, seed, excitation_profi
         float(umax),
         np.asarray(q, dtype=float),
         np.asarray(w, dtype=float),
-        np.diag(np.asarray(CONFIG['spacecraft']['inertia'], dtype=float)).copy(),
+        true_inertia_diag.copy(),
         dist_const,
         float(dist_noise_std),
         np.asarray(dist_noise_samples, dtype=float),
@@ -631,7 +1180,7 @@ def _simulate_pd_metrics_only(Kp, Kd, T, dt, umax, noise, seed, excitation_profi
 
     settle_time = _compute_settle_time(err_hist, t_hist)
     final_error = float(err_hist[-1])
-    overshoot = float(np.max(err_hist) - final_error)
+    overshoot = _compute_overshoot(err_hist)
     effort = _curve_integral(u_norm_hist, t_hist)
     max_err = float(np.max(err_hist))
 
@@ -646,6 +1195,7 @@ def _simulate_pd_metrics_only(Kp, Kd, T, dt, umax, noise, seed, excitation_profi
         'ISU': _curve_integral(u_norm_hist ** 2, t_hist),
         'sat_ratio': sat_count / max(1, steps),
         'controller_type': controller_type,
+        'control_feedback_source': 'truth',
         'u_limit': float(umax),
         'Kp': float(Kp),
         'Kd': float(Kd),
@@ -661,16 +1211,31 @@ def _save_simulation_data_tables(results, output_dir, controller_kind):
     controller_tag = str(controller_kind).upper()
     metrics_rows = [
         {'metric': 'controller_type', 'value': results.get('controller_type', controller_tag), 'unit': '-'},
+        {'metric': 'control_feedback_source', 'value': results.get('control_feedback_source', 'truth'), 'unit': '-'},
         {'metric': 'settle_time', 'value': f"{results['settle_time']:.6f}", 'unit': 's'},
         {'metric': 'overshoot', 'value': f"{results['overshoot']:.6f}", 'unit': 'deg'},
         {'metric': 'final_error', 'value': f"{results['final_error']:.6f}", 'unit': 'deg'},
+        {'metric': 'peak_error', 'value': f"{results['peak_error']:.6f}", 'unit': 'deg'},
+        {'metric': 'rms_error', 'value': f"{results['rms_error']:.6f}", 'unit': 'deg'},
+        {'metric': 'steady_state_rms', 'value': f"{results['steady_state_rms']:.6f}", 'unit': 'deg'},
         {'metric': 'IAE', 'value': f"{results['IAE']:.6f}", 'unit': 'deg·s'},
         {'metric': 'ITAE', 'value': f"{results['ITAE']:.6f}", 'unit': 'deg·s²'},
         {'metric': 'ISU', 'value': f"{results['ISU']:.6f}", 'unit': 'N²·m²·s'},
         {'metric': 'effort', 'value': f"{results['effort']:.6f}", 'unit': 'N·m·s'},
+        {'metric': 'peak_rate_deg', 'value': f"{results['peak_rate_deg']:.6f}", 'unit': 'deg/s'},
+        {'metric': 'peak_torque', 'value': f"{results['peak_torque']:.6f}", 'unit': 'N·m'},
+        {'metric': 'peak_axis_torque', 'value': f"{results['peak_axis_torque']:.6f}", 'unit': 'N·m'},
+        {'metric': 'control_limit_norm', 'value': f"{results['control_limit_norm']:.6f}", 'unit': 'N·m'},
+        {'metric': 'torque_usage_ratio', 'value': f"{results['torque_usage_ratio']:.6f}", 'unit': '-'},
         {'metric': 'sat_ratio', 'value': f"{results['sat_ratio']:.6f}", 'unit': '-'},
         {'metric': 'u_limit', 'value': f"{results['u_limit']:.6f}", 'unit': 'N·m'},
     ]
+    if np.isfinite(results.get('attitude_est_rmse', np.nan)):
+        metrics_rows.append({'metric': 'attitude_est_rmse', 'value': f"{results['attitude_est_rmse']:.6f}", 'unit': 'deg'})
+    if np.isfinite(results.get('bias_rmse', np.nan)):
+        metrics_rows.append({'metric': 'bias_rmse', 'value': f"{results['bias_rmse']:.6f}", 'unit': 'rad/s'})
+    if np.isfinite(results.get('disturbance_rmse', np.nan)):
+        metrics_rows.append({'metric': 'disturbance_rmse', 'value': f"{results['disturbance_rmse']:.6f}", 'unit': 'N·m'})
     if results.get('Kp') is not None:
         metrics_rows.append({'metric': 'Kp', 'value': f"{results['Kp']:.6f}", 'unit': '-'})
     if results.get('Kd') is not None:
@@ -725,6 +1290,9 @@ def _save_simulation_data_tables(results, output_dir, controller_kind):
             'wdot_y': f"{results['wdot_est'][idx, 1]:.8f}",
             'wdot_z': f"{results['wdot_est'][idx, 2]:.8f}",
             'regressor_min_sv': f"{results['regressor_min_sv'][idx]:.8f}",
+            'regressor_jxx_norm': f"{results['axis_regressor_norms'][idx, 0]:.8f}",
+            'regressor_jyy_norm': f"{results['axis_regressor_norms'][idx, 1]:.8f}",
+            'regressor_jzz_norm': f"{results['axis_regressor_norms'][idx, 2]:.8f}",
         })
     _write_csv_rows(
         Path(output_dir) / 'time_history.csv',
@@ -757,41 +1325,18 @@ def _run_inertia_identification_cases(run_profile, umax, output_layout, true_ine
         'T': max(18.0, float(run_profile['T'])),
         'dt': float(run_profile['dt']),
         'umax': float(umax),
-        'use_star_tracker': False,
+        'use_star_tracker': True,
         'show_plots': False,
         'seed': 7,
         'excitation_profile': 'aggressive',
         'true_inertia': ensure_diag_inertia(true_inertia),
     }
+    case_cfg = _build_identification_case_configs()
 
     rls_results = simulate_attitude_control(
         controller_type='ADRC',
         adrc_params=_build_default_adrc_params(base_cfg['dt']),
-        inertia_estimator_cfg={
-            'scheme': 'RLS',
-            'J0': np.array([0.125, 0.115, 0.082], dtype=float),
-            'lambda_factor': 1.0,
-            'P0': 2.5 * np.eye(3, dtype=float),
-            'min_inertia': 0.05,
-            'max_inertia': 0.24,
-            'min_accel_excitation': 0.09,
-            'min_torque_excitation': 0.035,
-            'max_update_step': 6e-4,
-            'min_regressor_norm': 0.06,
-            'innovation_clip': 0.06,
-            'innovation_deadzone': 0.006,
-            'min_update_norm': 4e-5,
-            'regularization': 1e-6,
-            'covariance_ceiling': 20.0,
-            'excitation_alpha': 0.08,
-            'warmup_time': 1.20,
-            'wdot_filter_alpha': 0.22,
-            'disturbance_filter_alpha': 0.15,
-            'disturbance_clip': 0.02,
-            'disturbance_enable_time': 2.5,
-            'window_size': 12,
-            'theta_smoothing': 0.55,
-        },
+        inertia_estimator_cfg=case_cfg['RLS'],
         **base_cfg,
     )
     _save_simulation_plot_suite(rls_results, output_layout['identification_rls'], 'ADRC', detail_level=OUTPUT_DETAIL_LEVEL)
@@ -799,33 +1344,7 @@ def _run_inertia_identification_cases(run_profile, umax, output_layout, true_ine
     mekf_results = simulate_attitude_control(
         controller_type='ADRC',
         adrc_params=_build_default_adrc_params(base_cfg['dt']),
-        inertia_estimator_cfg={
-            'scheme': 'MEKF',
-            'J0': np.array([0.125, 0.115, 0.082], dtype=float),
-            'P0': np.block([
-                [1e-4 * np.eye(3), np.zeros((3, 3)), np.zeros((3, 3))],
-                [np.zeros((3, 3)), 1e-6 * np.eye(3), np.zeros((3, 3))],
-                [np.zeros((3, 3)), np.zeros((3, 3)), 8e-4 * np.eye(3)],
-            ]),
-            'Q': np.block([
-                [1e-7 * np.eye(3), np.zeros((3, 3)), np.zeros((3, 3))],
-                [np.zeros((3, 3)), 1e-10 * np.eye(3), np.zeros((3, 3))],
-                [np.zeros((3, 3)), np.zeros((3, 3)), 8e-10 * np.eye(3)],
-            ]),
-            'min_inertia': 0.05,
-            'max_inertia': 0.24,
-            'min_regressor_norm': 2.5e-3,
-            'max_inertia_step': 3.5e-4,
-            'dynamics_measurement_noise': 0.08,
-            'min_dynamics_excitation': 0.08,
-            'dynamics_innovation_clip': 0.35,
-            'inertia_update_gain': 0.55,
-            'covariance_ceiling': 0.5,
-            'wdot_filter_alpha': 0.22,
-            'disturbance_filter_alpha': 0.18,
-            'disturbance_clip': 0.03,
-            'disturbance_enable_time': 1.5,
-        },
+        inertia_estimator_cfg=case_cfg['MEKF'],
         seed=11,
         **{k: v for k, v in base_cfg.items() if k != 'seed'},
     )
@@ -846,6 +1365,46 @@ def _plot_simulation_diagnostics(results, umax, controller_kind):
     plt.show()
 
 
+def _controller_comparison_metric_specs():
+    """
+    统一定义控制器对比指标的显示名称、单位与缩放方式。
+    """
+    return [
+        {'key': 'settle_time', 'name': '调节时间', 'unit': 's', 'scale': 1.0, 'print_fmt': '.2f', 'table_fmt': '.4f'},
+        {'key': 'overshoot', 'name': '超调量', 'unit': 'deg', 'scale': 1.0, 'print_fmt': '.2f', 'table_fmt': '.4f'},
+        {'key': 'final_error', 'name': '稳态误差', 'unit': 'deg', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'steady_state_rms', 'name': '尾段RMS误差', 'unit': 'deg', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'IAE', 'name': 'IAE', 'unit': 'deg·s', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'ITAE', 'name': 'ITAE', 'unit': 'deg·s^2', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'ISU', 'name': 'ISU', 'unit': 'N^2·m^2·s', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'effort', 'name': '控制能耗', 'unit': 'N·m·s', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'peak_axis_torque', 'name': '峰值单轴力矩', 'unit': 'N·m', 'scale': 1.0, 'print_fmt': '.3f', 'table_fmt': '.4f'},
+        {'key': 'sat_ratio', 'name': '饱和比例', 'unit': '%', 'scale': 100.0, 'print_fmt': '.1f', 'table_fmt': '.4f'},
+    ]
+
+
+def _safe_relative_improvement(baseline, candidate, zero_tol=1e-9):
+    """
+    计算相对改进百分比；当基准值接近零时返回 None，避免产生误导性超大百分比。
+    """
+    baseline = float(baseline)
+    candidate = float(candidate)
+    if abs(baseline) <= zero_tol:
+        if abs(candidate - baseline) <= zero_tol:
+            return 0.0
+        return None
+    return (baseline - candidate) / baseline * 100.0
+
+
+def _format_improvement_pct(improvement, digits=1, na_text='N/A'):
+    """
+    统一格式化改进百分比字符串。
+    """
+    if improvement is None or not np.isfinite(improvement):
+        return na_text
+    return f"{improvement:+.{int(digits)}f}%"
+
+
 def _print_controller_comparison(results_pd, results_adrc):
     """
     打印 PD 与 ADRC 的核心性能对比。
@@ -856,20 +1415,17 @@ def _print_controller_comparison(results_pd, results_adrc):
     print(f"\n{'指标':<20} {'PD控制器':<20} {'ADRC控制器':<20} {'改进百分比':<15}")
     print("-" * 75)
 
-    settle_impr = (results_pd['settle_time'] - results_adrc['settle_time']) / results_pd['settle_time'] * 100
-    print(f"{'调节时间 (s)':<20} {results_pd['settle_time']:<20.2f} {results_adrc['settle_time']:<20.2f} {settle_impr:>13.1f}%")
+    for spec in _controller_comparison_metric_specs():
+        pd_val = float(results_pd[spec['key']]) * spec['scale']
+        adrc_val = float(results_adrc[spec['key']]) * spec['scale']
+        improvement = _safe_relative_improvement(pd_val, adrc_val)
+        print(
+            f"{f'{spec['name']} ({spec['unit']})':<20} "
+            f"{format(pd_val, spec['print_fmt']):<20} "
+            f"{format(adrc_val, spec['print_fmt']):<20} "
+            f"{_format_improvement_pct(improvement, digits=1):>13}"
+        )
 
-    overshoot_impr = (results_pd['overshoot'] - results_adrc['overshoot']) / (results_pd['overshoot'] + 1e-6) * 100
-    print(f"{'超调量 (度)':<20} {results_pd['overshoot']:<20.2f} {results_adrc['overshoot']:<20.2f} {overshoot_impr:>13.1f}%")
-
-    final_error_impr = (results_pd['final_error'] - results_adrc['final_error']) / (results_pd['final_error'] + 1e-6) * 100
-    print(f"{'稳态误差 (度)':<20} {results_pd['final_error']:<20.3f} {results_adrc['final_error']:<20.3f} {final_error_impr:>13.1f}%")
-    iae_impr = (results_pd['IAE'] - results_adrc['IAE']) / (results_pd['IAE'] + 1e-6) * 100
-    print(f"{'IAE (deg·s)':<20} {results_pd['IAE']:<20.3f} {results_adrc['IAE']:<20.3f} {iae_impr:>13.1f}%")
-    itae_impr = (results_pd['ITAE'] - results_adrc['ITAE']) / (results_pd['ITAE'] + 1e-6) * 100
-    print(f"{'ITAE (deg·s^2)':<20} {results_pd['ITAE']:<20.3f} {results_adrc['ITAE']:<20.3f} {itae_impr:>13.1f}%")
-    isu_impr = (results_pd['ISU'] - results_adrc['ISU']) / (results_pd['ISU'] + 1e-6) * 100
-    print(f"{'ISU (N^2·m^2·s)':<20} {results_pd['ISU']:<20.3f} {results_adrc['ISU']:<20.3f} {isu_impr:>13.1f}%")
     print("\n[关键指标] Steady-state Error（稳态误差）")
     print(f"  PD   : {results_pd['final_error']:.4f} deg")
     print(f"  ADRC : {results_adrc['final_error']:.4f} deg")
@@ -878,45 +1434,223 @@ def _print_controller_comparison(results_pd, results_adrc):
     else:
         print("  结论 : 当前参数下 ADRC 静差未优于 PD，建议继续提升 omega_o 或延长仿真时间。")
 
-    effort_impr = (results_pd['effort'] - results_adrc['effort']) / results_pd['effort'] * 100
-    print(f"{'控制能耗':<20} {results_pd['effort']:<20.3f} {results_adrc['effort']:<20.3f} {effort_impr:>13.1f}%")
-
-    sat_impr = (results_pd['sat_ratio'] - results_adrc['sat_ratio']) / (results_pd['sat_ratio'] + 1e-6) * 100
-    print(f"{'饱和比例 (%)':<20} {results_pd['sat_ratio']*100:<20.1f} {results_adrc['sat_ratio']*100:<20.1f} {sat_impr:>13.1f}%")
-
 
 def _save_controller_comparison_summary(results_pd, results_adrc, output_dir):
     """
     保存 PD 与 ADRC 的对比指标表，便于直接插入报告。
     """
     rows = []
-    metrics = [
-        ('settle_time', '调节时间', 's'),
-        ('overshoot', '超调量', 'deg'),
-        ('final_error', '稳态误差', 'deg'),
-        ('IAE', 'IAE', 'deg·s'),
-        ('ITAE', 'ITAE', 'deg·s^2'),
-        ('ISU', 'ISU', 'N^2·m^2·s'),
-        ('effort', '控制能耗', 'N·m·s'),
-        ('sat_ratio', '饱和比例', '-'),
-    ]
-    for key, name, unit in metrics:
-        pd_val = float(results_pd[key])
-        adrc_val = float(results_adrc[key])
-        improvement = (pd_val - adrc_val) / (pd_val + 1e-12) * 100.0
+    for spec in _controller_comparison_metric_specs():
+        pd_raw = float(results_pd[spec['key']])
+        adrc_raw = float(results_adrc[spec['key']])
+        pd_val = pd_raw * spec['scale']
+        adrc_val = adrc_raw * spec['scale']
+        improvement = _safe_relative_improvement(pd_val, adrc_val)
         rows.append({
-            'metric_key': key,
-            'metric_name': name,
-            'unit': unit,
+            'metric_key': spec['key'],
+            'metric_name': spec['name'],
+            'unit': spec['unit'],
             'pd_value': f"{pd_val:.6f}",
             'adrc_value': f"{adrc_val:.6f}",
-            'improvement_pct': f"{improvement:.3f}",
+            'improvement_pct': '' if improvement is None else f"{improvement:.3f}",
         })
     _write_csv_rows(
         Path(output_dir) / 'controller_comparison_summary.csv',
         ['metric_key', 'metric_name', 'unit', 'pd_value', 'adrc_value', 'improvement_pct'],
         rows,
     )
+
+
+def _remove_comparison_plot_files(output_dir):
+    """
+    在快速模式下删除旧对比图，避免报告引用历史运行残留文件。
+    """
+    output_dir = Path(output_dir)
+    for filename in (
+        'pd_vs_adrc_comparison.png',
+        'pd_vs_adrc_time_response_overlay.png',
+        'adrc_disturbance_estimation.png',
+    ):
+        path = output_dir / filename
+        if path.exists():
+            path.unlink()
+
+
+def _build_controller_comparison_rows(results_pd, results_adrc):
+    """
+    统一生成控制器对比表的 Markdown 行数据。
+    """
+    rows = []
+    for spec in _controller_comparison_metric_specs():
+        pd_val = float(results_pd[spec['key']]) * spec['scale']
+        adrc_val = float(results_adrc[spec['key']]) * spec['scale']
+        improvement = _safe_relative_improvement(pd_val, adrc_val)
+        rows.append([
+            spec['name'],
+            format(pd_val, spec['table_fmt']),
+            format(adrc_val, spec['table_fmt']),
+            spec['unit'],
+            _format_improvement_pct(improvement, digits=2),
+        ])
+    return rows
+
+
+def _build_optimizer_ranking_rows(tuning):
+    """
+    统一生成优化器排序表的 Markdown 行数据。
+    """
+    rows = []
+    for idx, row in enumerate(tuning.get('ranking', []), start=1):
+        rows.append([
+            idx,
+            row['method'],
+            f"{row['Kp']:.4f}",
+            f"{row['Kd']:.4f}",
+            f"{row['score']:.4f}",
+            f"{row['settle_time']:.4f}",
+            f"{row['final_error']:.4f}",
+            f"{row['effort']:.4f}",
+        ])
+    return rows
+
+
+def _format_best_optimizer_summary(tuning):
+    """
+    生成最优优化器的一行摘要文本。
+    """
+    best_method = tuning.get('best')
+    if best_method is None:
+        return "无"
+    return (
+        f"{best_method['method']} (Kp={best_method['Kp']:.4f}, "
+        f"Kd={best_method['Kd']:.4f}, score={best_method['score']:.4f})"
+    )
+
+
+def _format_selected_inertia_report(selected_inertia_summary):
+    """
+    生成前置辨识选型的摘要与验证说明文本。
+    """
+    if selected_inertia_summary is None:
+        return "未使用前置辨识结果", ""
+
+    selected_inertia = ensure_diag_inertia(selected_inertia_summary.get('inertia', [0.50, 0.50, 0.50]))
+    selected_scheme = selected_inertia_summary.get('scheme', 'fallback')
+    selected_update_ratio = float(selected_inertia_summary.get('update_ratio', 0.0))
+    selected_inertia_text = (
+        f"{selected_scheme}: "
+        f"[{selected_inertia[0]:.4f}, {selected_inertia[1]:.4f}, {selected_inertia[2]:.4f}] kg·m² "
+        f"(更新占比 {selected_update_ratio:.1f}%)"
+    )
+
+    validation_score = selected_inertia_summary.get('validation_score')
+    validation_settle = selected_inertia_summary.get('validation_settle_time')
+    validation_final_error = selected_inertia_summary.get('validation_final_error')
+    selected_inertia_detail = ""
+    if validation_score is not None and np.isfinite(validation_score):
+        selected_inertia_detail = (
+            f"候选验证得分={validation_score:.4f}, "
+            f"Ts={float(validation_settle):.3f}s, "
+            f"Final={float(validation_final_error):.4f}deg"
+        )
+    return selected_inertia_text, selected_inertia_detail
+
+
+def _format_adrc_tuning_report(adrc_tuning):
+    """
+    生成 ADRC 自动整定摘要文本。
+    """
+    if adrc_tuning is None or adrc_tuning.get('best') is None:
+        return "未执行 ADRC 自动整定"
+
+    best_adrc = adrc_tuning['best']
+    return (
+        f"omega_c={best_adrc['omega_c']:.4f}, omega_o={best_adrc['omega_o']:.4f}, "
+        f"ratio={best_adrc['omega_ratio']:.3f}, score={best_adrc['score']:.4f}"
+    )
+
+
+def _resolve_controller_tradeoff_text(results_pd, results_adrc):
+    """
+    生成控制器对比的文字解读。
+    """
+    effort_delta = float(results_adrc['effort'] - results_pd['effort'])
+    if results_adrc['final_error'] < results_pd['final_error'] and effort_delta > 0.0:
+        return "ADRC 显著降低了稳态误差和调节时间，但为此付出了更高的控制能耗与单轴峰值力矩。"
+    if results_adrc['final_error'] < results_pd['final_error']:
+        return "ADRC 在精度和速度上同时优于 PD，且没有增加明显的控制开销。"
+    return "当前参数下 ADRC 的精度收益不明显，建议继续检查带宽整定与扰动补偿配置。"
+
+
+def _build_report_image_blocks(output_layout, run_profile, identification_results):
+    """
+    统一生成报告中要插入的图像块列表。
+    """
+    image_blocks = [
+        ("优化综合仪表板", output_layout['optimization'] / 'pd_optimizer_report_dashboard.png'),
+        ("优化景观图", output_layout['optimization'] / 'pd_optimizer_landscape.png'),
+        ("优化器收敛统计图", output_layout['optimization'] / 'pd_optimizer_convergence_statistics.png'),
+        ("优化器最优闭环响应对比图", output_layout['optimization'] / 'pd_optimizer_best_response_dashboard.png'),
+        ("优化器性能权衡图", output_layout['optimization'] / 'pd_optimizer_tradeoff_scatter.png'),
+        ("优化器指标热力图", output_layout['optimization'] / 'pd_optimizer_metric_heatmap.png'),
+        ("PD 单次仿真综合仪表板", output_layout['simulation_pd'] / 'simulation_report_dashboard.png'),
+        ("ADRC 单次仿真综合仪表板", output_layout['simulation_adrc'] / 'simulation_report_dashboard.png'),
+    ]
+    if run_profile.get('save_comparison_plots', False):
+        image_blocks.extend([
+            ("控制器性能对比图", output_layout['comparison'] / 'pd_vs_adrc_comparison.png'),
+            ("控制器时域叠加图", output_layout['comparison'] / 'pd_vs_adrc_time_response_overlay.png'),
+        ])
+    if identification_results:
+        image_blocks.extend([
+            ("RLS 参数辨识综合图", output_layout['identification_rls'] / 'inertia_identification_dashboard.png'),
+            ("MEKF 参数辨识综合图", output_layout['identification_mekf'] / 'inertia_identification_dashboard.png'),
+        ])
+    return image_blocks
+
+
+def _build_identification_summary_rows(identification_results):
+    """
+    统一生成参数辨识摘要表数据。
+    """
+    rows = []
+    for scheme_name, res in identification_results.items():
+        inertia_ref = np.asarray(res.get('inertia_reference', res['inertia_est'][0]), dtype=float)
+        inertia_final = np.asarray(res['inertia_est'][-1], dtype=float)
+        err_norm = float(np.linalg.norm(inertia_final - inertia_ref))
+        update_ratio = float(np.mean(np.asarray(res.get('inertia_update_mask', []), dtype=float) > 0.5) * 100.0)
+        rows.append([
+            scheme_name,
+            f"[{inertia_ref[0]:.4f}, {inertia_ref[1]:.4f}, {inertia_ref[2]:.4f}]",
+            f"[{inertia_final[0]:.4f}, {inertia_final[1]:.4f}, {inertia_final[2]:.4f}]",
+            f"{err_norm:.4e}",
+            f"{update_ratio:.1f}%",
+        ])
+    return rows
+
+
+def _build_report_file_index_rows(root_dir, output_layout, adrc_tuning, identification_results):
+    """
+    统一生成报告中文件索引表数据。
+    """
+    rows = [
+        ['优化结果', _relative_markdown_path(root_dir, output_layout['optimization']), '优化图像、已评估点与排序表'],
+        ['PD 仿真', _relative_markdown_path(root_dir, output_layout['simulation_pd']), 'PD 单次仿真图像与时序数据'],
+        ['ADRC 仿真', _relative_markdown_path(root_dir, output_layout['simulation_adrc']), 'ADRC 单次仿真图像与时序数据'],
+        ['对比结果', _relative_markdown_path(root_dir, output_layout['comparison']), 'PD vs ADRC 对比图和摘要表'],
+    ]
+    if adrc_tuning is not None and adrc_tuning.get('output_dir'):
+        rows.append([
+            'ADRC 整定',
+            _relative_markdown_path(root_dir, adrc_tuning['output_dir']),
+            'ADRC 带宽整定结果与排序表',
+        ])
+    if identification_results:
+        rows.extend([
+            ['RLS 辨识', _relative_markdown_path(root_dir, output_layout['identification_rls']), 'RLS 参数辨识图像与时序数据'],
+            ['MEKF 辨识', _relative_markdown_path(root_dir, output_layout['identification_mekf']), '增广 MEKF 参数辨识图像与时序数据'],
+        ])
+    return rows
 
 
 def _generate_markdown_report(
@@ -935,93 +1669,13 @@ def _generate_markdown_report(
     root_dir = Path(output_layout['root'])
     report_path = root_dir / 'simulation_summary_report.md'
     generated_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    comparison_rows = []
-    metrics = [
-        ('调节时间', 'settle_time', 's'),
-        ('超调量', 'overshoot', 'deg'),
-        ('稳态误差', 'final_error', 'deg'),
-        ('IAE', 'IAE', 'deg·s'),
-        ('ITAE', 'ITAE', 'deg·s²'),
-        ('ISU', 'ISU', 'N²·m²·s'),
-        ('控制能耗', 'effort', 'N·m·s'),
-        ('饱和比例', 'sat_ratio', '-'),
-    ]
-    for display_name, key, unit in metrics:
-        pd_val = float(results_pd[key])
-        adrc_val = float(results_adrc[key])
-        improvement = (pd_val - adrc_val) / (pd_val + 1e-12) * 100.0
-        comparison_rows.append([
-            display_name,
-            f"{pd_val:.4f}",
-            f"{adrc_val:.4f}",
-            unit,
-            f"{improvement:+.2f}%",
-        ])
-
-    ranking_rows = []
-    for idx, row in enumerate(tuning.get('ranking', []), start=1):
-        ranking_rows.append([
-            idx,
-            row['method'],
-            f"{row['Kp']:.4f}",
-            f"{row['Kd']:.4f}",
-            f"{row['score']:.4f}",
-            f"{row['settle_time']:.4f}",
-            f"{row['final_error']:.4f}",
-            f"{row['effort']:.4f}",
-        ])
-
-    best_method = tuning.get('best')
-    best_summary = "无"
-    if best_method is not None:
-        best_summary = (
-            f"{best_method['method']} (Kp={best_method['Kp']:.4f}, "
-            f"Kd={best_method['Kd']:.4f}, score={best_method['score']:.4f})"
-        )
-
-    selected_inertia_text = "未使用前置辨识结果"
-    selected_inertia_detail = ""
-    if selected_inertia_summary is not None:
-        selected_inertia = ensure_diag_inertia(selected_inertia_summary.get('inertia', [0.05, 0.05, 0.05]))
-        selected_scheme = selected_inertia_summary.get('scheme', 'fallback')
-        selected_update_ratio = float(selected_inertia_summary.get('update_ratio', 0.0))
-        selected_inertia_text = (
-            f"{selected_scheme}: "
-            f"[{selected_inertia[0]:.4f}, {selected_inertia[1]:.4f}, {selected_inertia[2]:.4f}] kg·m² "
-            f"(更新占比 {selected_update_ratio:.1f}%)"
-        )
-        validation_score = selected_inertia_summary.get('validation_score')
-        validation_settle = selected_inertia_summary.get('validation_settle_time')
-        validation_final_error = selected_inertia_summary.get('validation_final_error')
-        if validation_score is not None and np.isfinite(validation_score):
-            selected_inertia_detail = (
-                f"候选验证得分={validation_score:.4f}, "
-                f"Ts={float(validation_settle):.3f}s, "
-                f"Final={float(validation_final_error):.4f}deg"
-            )
-
-    adrc_tuning_text = "未执行 ADRC 自动整定"
-    if adrc_tuning is not None and adrc_tuning.get('best') is not None:
-        best_adrc = adrc_tuning['best']
-        adrc_tuning_text = (
-            f"omega_c={best_adrc['omega_c']:.4f}, omega_o={best_adrc['omega_o']:.4f}, "
-            f"ratio={best_adrc['omega_ratio']:.3f}, score={best_adrc['score']:.4f}"
-        )
-
-    image_blocks = [
-        ("优化综合仪表板", output_layout['optimization'] / 'pd_optimizer_report_dashboard.png'),
-        ("优化景观图", output_layout['optimization'] / 'pd_optimizer_landscape.png'),
-        ("PD 单次仿真综合仪表板", output_layout['simulation_pd'] / 'simulation_report_dashboard.png'),
-        ("ADRC 单次仿真综合仪表板", output_layout['simulation_adrc'] / 'simulation_report_dashboard.png'),
-        ("控制器性能对比图", output_layout['comparison'] / 'pd_vs_adrc_comparison.png'),
-        ("控制器时域叠加图", output_layout['comparison'] / 'pd_vs_adrc_time_response_overlay.png'),
-    ]
-    if identification_results:
-        image_blocks.extend([
-            ("RLS 参数辨识综合图", output_layout['identification_rls'] / 'inertia_identification_dashboard.png'),
-            ("MEKF 参数辨识综合图", output_layout['identification_mekf'] / 'inertia_identification_dashboard.png'),
-        ])
+    comparison_rows = _build_controller_comparison_rows(results_pd, results_adrc)
+    ranking_rows = _build_optimizer_ranking_rows(tuning)
+    best_summary = _format_best_optimizer_summary(tuning)
+    selected_inertia_text, selected_inertia_detail = _format_selected_inertia_report(selected_inertia_summary)
+    adrc_tuning_text = _format_adrc_tuning_report(adrc_tuning)
+    tradeoff_text = _resolve_controller_tradeoff_text(results_pd, results_adrc)
+    image_blocks = _build_report_image_blocks(output_layout, run_profile, identification_results)
 
     lines = [
         "# 卫星姿态控制仿真结果汇总报告",
@@ -1030,6 +1684,8 @@ def _generate_markdown_report(
         f"- 运行档位: `{run_profile['profile']}`",
         f"- 仿真时长: `{run_profile['T']}` s",
         f"- 时间步长: `{run_profile['dt']}` s",
+        f"- PD 闭环反馈源: `{results_pd.get('control_feedback_source', 'truth')}`",
+        f"- ADRC 闭环反馈源: `{results_adrc.get('control_feedback_source', 'truth')}`",
         f"- 前置辨识采用惯量: `{selected_inertia_text}`",
         f"- ADRC 整定结果: `{adrc_tuning_text}`",
         f"- 优化最优方法: `{best_summary}`",
@@ -1041,8 +1697,12 @@ def _generate_markdown_report(
         f"- ADRC 控制器末端姿态误差: `{results_adrc['final_error']:.4f} deg`",
         f"- PD 控制器调节时间: `{results_pd['settle_time']:.4f} s`",
         f"- ADRC 控制器调节时间: `{results_adrc['settle_time']:.4f} s`",
+        f"- PD 尾段 RMS 误差: `{results_pd['steady_state_rms']:.4f} deg`",
+        f"- ADRC 尾段 RMS 误差: `{results_adrc['steady_state_rms']:.4f} deg`",
         f"- PD 控制器控制能耗: `{results_pd['effort']:.4f} N·m·s`",
         f"- ADRC 控制器控制能耗: `{results_adrc['effort']:.4f} N·m·s`",
+        f"- 峰值单轴力矩对比: `PD={results_pd['peak_axis_torque']:.4f} N·m, ADRC={results_adrc['peak_axis_torque']:.4f} N·m`",
+        f"- 结果解读: `{tradeoff_text}`",
         "",
         "## 2. 控制器性能对比表",
         "",
@@ -1074,6 +1734,12 @@ def _generate_markdown_report(
         "",
     ])
 
+    if not run_profile.get('save_comparison_plots', False):
+        lines.extend([
+            "- 当前为快速模式，本次运行未刷新控制器对比图，仅保留本轮生成的单控制器图像与摘要表。",
+            "",
+        ])
+
     for title, img_path in image_blocks:
         if Path(img_path).exists():
             rel_path = _relative_markdown_path(root_dir, img_path)
@@ -1090,19 +1756,7 @@ def _generate_markdown_report(
     ])
 
     if identification_results:
-        id_rows = []
-        for scheme_name, res in identification_results.items():
-            inertia_ref = np.asarray(res.get('inertia_reference', res['inertia_est'][0]), dtype=float)
-            inertia_final = np.asarray(res['inertia_est'][-1], dtype=float)
-            err_norm = float(np.linalg.norm(inertia_final - inertia_ref))
-            update_ratio = float(np.mean(np.asarray(res.get('inertia_update_mask', []), dtype=float) > 0.5) * 100.0)
-            id_rows.append([
-                scheme_name,
-                f"[{inertia_ref[0]:.4f}, {inertia_ref[1]:.4f}, {inertia_ref[2]:.4f}]",
-                f"[{inertia_final[0]:.4f}, {inertia_final[1]:.4f}, {inertia_final[2]:.4f}]",
-                f"{err_norm:.4e}",
-                f"{update_ratio:.1f}%",
-            ])
+        id_rows = _build_identification_summary_rows(identification_results)
         lines.extend([
             _markdown_table(
                 ['方案', '参考惯量', '最终估计', '最终误差范数', '更新占比'],
@@ -1143,21 +1797,12 @@ def _generate_markdown_report(
         "",
     ])
 
-    file_index_rows = [
-        ['优化结果', _relative_markdown_path(root_dir, output_layout['optimization']), '优化图像、已评估点与排序表'],
-        ['PD 仿真', _relative_markdown_path(root_dir, output_layout['simulation_pd']), 'PD 单次仿真图像与时序数据'],
-        ['ADRC 仿真', _relative_markdown_path(root_dir, output_layout['simulation_adrc']), 'ADRC 单次仿真图像与时序数据'],
-        ['对比结果', _relative_markdown_path(root_dir, output_layout['comparison']), 'PD vs ADRC 对比图和摘要表'],
-    ]
-    if adrc_tuning is not None and adrc_tuning.get('output_dir'):
-        file_index_rows.append(
-            ['ADRC 整定', _relative_markdown_path(root_dir, adrc_tuning['output_dir']), 'ADRC 带宽整定结果与排序表']
-        )
-    if identification_results:
-        file_index_rows.extend([
-            ['RLS 辨识', _relative_markdown_path(root_dir, output_layout['identification_rls']), 'RLS 参数辨识图像与时序数据'],
-            ['MEKF 辨识', _relative_markdown_path(root_dir, output_layout['identification_mekf']), '增广 MEKF 参数辨识图像与时序数据'],
-        ])
+    file_index_rows = _build_report_file_index_rows(
+        root_dir=root_dir,
+        output_layout=output_layout,
+        adrc_tuning=adrc_tuning,
+        identification_results=identification_results,
+    )
 
     lines.extend([
         _markdown_table(
@@ -1182,7 +1827,7 @@ def _save_controller_comparison_plots(results_pd, results_adrc, umax, output_dir
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n生成并保存对比图表...")
+    print("\n生成并保存对比图表...")
     fig = plot_controller_comparison_dashboard(results_pd, results_adrc, umax, title='PD控制器 vs ADRC控制器性能对比')
     _save_figure(fig, output_dir / "pd_vs_adrc_comparison.png")
 
@@ -1221,6 +1866,7 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
                                inertia_estimator_cfg=None,
                                excitation_profile='auto',
                                true_inertia=None,
+                               control_feedback_source='truth',
                                result_mode='full',
                                verbose=True):
     """
@@ -1242,6 +1888,7 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
         inertia_estimator_cfg: 在线惯量辨识配置
         excitation_profile: 激励档位 ('auto'/'nominal'/'aggressive')
         true_inertia: 真实转动惯量，对角元向量或 3x3 矩阵
+        control_feedback_source: 控制闭环反馈源 ('truth'/'estimate')
         result_mode: 返回模式 ('full'/'metrics')；PD 调参时可走轻量指标路径
     
     返回:
@@ -1250,12 +1897,14 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
     # 固定随机种子，保证 PD 与 ADRC 在各自仿真中经历完全一致的随机序列
     result_mode = str(result_mode).strip().lower()
     controller_kind = controller_type.upper()
+    control_feedback_source = str(control_feedback_source).strip().lower()
     if (
         result_mode == 'metrics'
         and controller_kind == 'PD'
         and not use_star_tracker
         and inertia_estimator_cfg is None
         and not show_plots
+        and control_feedback_source == 'truth'
     ):
         return _simulate_pd_metrics_only(
             Kp=Kp,
@@ -1267,82 +1916,70 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
             seed=seed,
             excitation_profile=excitation_profile,
             controller_type=controller_type,
+            true_inertia=true_inertia,
         )
+    if control_feedback_source not in {'truth', 'estimate'}:
+        raise ValueError("control_feedback_source must be 'truth' or 'estimate'")
 
     rng = np.random.RandomState(seed)
     
     # 初始化系统
     sc = Spacecraft(J=_resolve_true_inertia_matrix(true_inertia), umax=umax)
-    st = StarTracker(n_stars_catalog=1600, fov_deg=fov_deg, dir_noise_std=noise) if use_star_tracker else None
+    st = (
+        StarTracker(
+            n_stars_catalog=1600,
+            fov_deg=fov_deg,
+            dir_noise_std=noise,
+            rng=rng,
+        )
+        if use_star_tracker else None
+    )
     
-    # 初始化控制器
-    if controller_kind == 'ADRC':
-        if adrc_params is None:
-            adrc_params = _build_default_adrc_params(dt)
-        adrc_controller = ADRCController(**adrc_params)
-        if verbose:
-            print(f"使用ADRC控制器: omega_c={adrc_params.get('omega_c', 2.5)}, omega_o={adrc_params.get('omega_o', 8.0)}")
-    else:
-        adrc_controller = None
-        if verbose:
-            print(f"使用PD控制器: Kp={Kp}, Kd={Kd}")
+    adrc_controller, adrc_params = _init_controller(
+        controller_kind=controller_kind,
+        dt=dt,
+        Kp=Kp,
+        Kd=Kd,
+        adrc_params=adrc_params,
+        verbose=verbose,
+    )
     
     # 初始条件
-    q, w = _resolve_excitation_initial_state(rng, T, excitation_profile)
+    true_inertia_diag = np.diag(_resolve_true_inertia_matrix(true_inertia))
+    nominal_inertia_diag = np.diag(np.asarray(CONFIG['spacecraft']['inertia'], dtype=float))
+    rate_scale = np.sqrt(np.mean(true_inertia_diag) / max(np.mean(nominal_inertia_diag), 1e-12))
+    q, w = _resolve_excitation_initial_state(rng, T, excitation_profile, rate_scale=rate_scale)
     qd = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)  # 期望姿态（单位四元数）
     
-    # 初始化 MEKF / 增广 MEKF 与在线惯量辨识器
-    initial_J_diag = np.diag(sc.J).copy()
-    inertia_reference = initial_J_diag.copy()
-    inertia_scheme, inertia_identifier = _build_inertia_identifier(
-        inertia_estimator_cfg,
-        initial_J_diag=initial_J_diag,
+    estimation_ctx = _build_estimation_context(
+        sc=sc,
+        inertia_estimator_cfg=inertia_estimator_cfg,
         initial_q=q,
+        dt=dt,
     )
-    if inertia_scheme == 'MEKF':
-        mekf = inertia_identifier
-    else:
-        mekf = MEKFBiasOnly()
-        mekf.q = q.copy()
-    use_augmented_mekf = isinstance(mekf, MEKF_Augmented)
-    estimator_cfg = {} if inertia_estimator_cfg is None else dict(inertia_estimator_cfg)
-    inertia_warmup_steps = int(max(0.0, float(estimator_cfg.get('warmup_time', 0.0))) / dt)
-    wdot_filter_alpha = float(np.clip(estimator_cfg.get('wdot_filter_alpha', 1.0), 0.0, 1.0))
-    disturbance_filter_alpha = float(np.clip(estimator_cfg.get('disturbance_filter_alpha', 1.0), 0.0, 1.0))
-    disturbance_enable_steps = int(max(0.0, float(estimator_cfg.get('disturbance_enable_time', 0.0))) / dt)
-    disturbance_clip = estimator_cfg.get('disturbance_clip')
-    regressor_min_sv_reference = None
-    if inertia_scheme == 'RLS' and inertia_identifier is not None:
-        regressor_min_sv_reference = float(estimator_cfg.get('min_regressor_norm', inertia_identifier.min_regressor_norm))
+    mekf = estimation_ctx['mekf']
+    use_augmented_mekf = estimation_ctx['use_augmented_mekf']
+    inertia_scheme = estimation_ctx['inertia_scheme']
+    inertia_identifier = estimation_ctx['inertia_identifier']
+    inertia_reference = estimation_ctx['inertia_reference']
+    estimator_cfg = estimation_ctx['estimator_cfg']
+    inertia_warmup_steps = estimation_ctx['inertia_warmup_steps']
+    wdot_filter_alpha = estimation_ctx['wdot_filter_alpha']
+    wdot_regression_window = estimation_ctx['wdot_regression_window']
+    disturbance_filter_alpha = estimation_ctx['disturbance_filter_alpha']
+    disturbance_enable_steps = estimation_ctx['disturbance_enable_steps']
+    disturbance_clip = estimation_ctx['disturbance_clip']
+    regressor_min_sv_reference = estimation_ctx['regressor_min_sv_reference']
     
     steps = int(T / dt)
     history = _allocate_simulation_history(steps)
-    t_hist = history['t']
-    q_true_hist = history['q_true']
-    q_est_hist = history['q_est']
-    w_hist = history['w']
-    u_hist = history['u']
-    err_hist = history['err']
-    dist_true_hist = history['dist_true']
-    dist_est_hist = history['dist_est']
-    gyro_bias_true_hist = history['gyro_bias_true']
-    gyro_bias_est_hist = history['gyro_bias_est']
-    inertia_est_hist = history['inertia_est']
-    inertia_update_mask_hist = history['inertia_update_mask']
-    wdot_est_hist = history['wdot_est']
-    regressor_min_sv_hist = history['regressor_min_sv']
     sat_count = 0
     u_prev = np.zeros(3)  # 用于ADRC的上一时刻控制量
-    w_filt_prev = None
+    w_filt_window = deque(maxlen=wdot_regression_window)
     wdot_filt_prev = None
     dist_torque_filt_prev = None
-    nominal_J_diag = initial_J_diag.copy()
-    if inertia_scheme == 'RLS' and inertia_identifier is not None:
-        current_J_diag = inertia_identifier.get_inertia_diag()
-    elif inertia_scheme == 'MEKF' and use_augmented_mekf:
-        current_J_diag = mekf.get_inertia_diag()
-    else:
-        current_J_diag = initial_J_diag.copy()
+    nominal_J_diag = estimation_ctx['nominal_J_diag']
+    current_J_diag = estimation_ctx['current_J_diag']
 
     # 外部扰动：常值项 + 小幅随机噪声
     # 常值项用于体现 ADRC 对偏置扰动（如重力梯度/气动不平衡）的抑制能力
@@ -1365,25 +2002,19 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
     # 主仿真循环
     for k in range(steps):
         t = k * dt
-        t_hist[k] = t
-        
-        # 获取真实姿态
-        Rtrue = quat_to_R(q) if (use_star_tracker and st is not None) else None
-        
-        # 星敏感器观测
-        if use_star_tracker and st is not None:
-            q_meas = st.observe(Rtrue)
-            if q_meas is None:
-                # 如果星敏感器失效，使用真实姿态（加噪声）
-                q_meas = _apply_quaternion_noise(q, fallback_noise_axes[k], fallback_startracker_angles[k])
-        else:
-            # 理想测量（加小噪声）
-            q_meas = _apply_quaternion_noise(q, fallback_noise_axes[k], fallback_ideal_angles[k])
+        q_meas = _resolve_attitude_measurement(
+            q=q,
+            use_star_tracker=use_star_tracker,
+            star_tracker=st,
+            step_idx=k,
+            fallback_noise_axes=fallback_noise_axes,
+            fallback_startracker_angles=fallback_startracker_angles,
+            fallback_ideal_angles=fallback_ideal_angles,
+        )
         
         # 真实陀螺偏置随机游走，并生成含偏置测量值
         true_bias += gyro_bias_rw_std * gyro_bias_rw_noise[k]
         w_gyro = w + true_bias + gyro_noise_std * gyro_measurement_noise[k]
-        gyro_bias_true_hist[k] = true_bias
         if use_augmented_mekf:
             mekf.predict(w_gyro, dt, u_applied=u_prev)
         else:
@@ -1392,106 +2023,98 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
         # MEKF更新
         mekf.update(q_meas)
 
-        # 近似角加速度：使用当前与上一拍滤波角速度做离散差分
+        # 近似角加速度：对最近若干拍滤波角速度做短窗回归，降低差分放噪问题
         w_filt = w_gyro - mekf.b
-        if w_filt_prev is None:
-            wdot_raw = np.zeros(3, dtype=float)
-        else:
-            wdot_raw = (w_filt - w_filt_prev) / dt
-        w_filt_prev = w_filt.copy()
+        w_filt_window.append(w_filt.copy())
+        omega_id, wdot_raw = _estimate_angular_rate_regression_state(w_filt_window, dt)
         wdot_est = _blend_vector(wdot_filt_prev, wdot_raw, wdot_filter_alpha)
         wdot_filt_prev = wdot_est.copy()
+        q_ctrl, w_ctrl, _ = _resolve_control_feedback_state(
+            control_feedback_source=control_feedback_source,
+            q_true=q,
+            w_true=w,
+            q_est=mekf.q,
+            w_est=w_filt,
+        )
 
-        if inertia_identifier is not None and inertia_scheme in {'RLS', 'MEKF'}:
-            dist_torque_raw = (
-                adrc_controller.get_disturbance_estimate_torque()
-                if adrc_controller is not None else np.zeros(3, dtype=float)
-            )
-            dist_torque_est = _blend_vector(dist_torque_filt_prev, dist_torque_raw, disturbance_filter_alpha)
-            dist_torque_filt_prev = dist_torque_est.copy()
-            if disturbance_clip is not None:
-                dist_norm = np.linalg.norm(dist_torque_est)
-                dist_limit = float(max(0.0, disturbance_clip))
-                if dist_norm > dist_limit > 0.0:
-                    dist_torque_est = dist_torque_est * (dist_limit / (dist_norm + 1e-12))
-            if k < disturbance_enable_steps:
-                dist_torque_est = np.zeros(3, dtype=float)
-        else:
-            dist_torque_est = np.zeros(3, dtype=float)
+        dist_torque_est, dist_torque_filt_prev = _resolve_disturbance_torque_estimate(
+            step_idx=k,
+            inertia_scheme=inertia_scheme,
+            inertia_identifier=inertia_identifier,
+            adrc_controller=adrc_controller,
+            disturbance_filter_alpha=disturbance_filter_alpha,
+            disturbance_clip=disturbance_clip,
+            disturbance_enable_steps=disturbance_enable_steps,
+            dist_torque_filt_prev=dist_torque_filt_prev,
+        )
+        current_J_diag, inertia_updated, regressor_min_sv, axis_regressor_norms = _update_inertia_estimation(
+            step_idx=k,
+            inertia_scheme=inertia_scheme,
+            inertia_identifier=inertia_identifier,
+            use_augmented_mekf=use_augmented_mekf,
+            mekf=mekf,
+            inertia_warmup_steps=inertia_warmup_steps,
+            omega_id=omega_id,
+            wdot_est=wdot_est,
+            u_prev=u_prev,
+            dist_torque_est=dist_torque_est,
+            nominal_J_diag=nominal_J_diag,
+            adrc_controller=adrc_controller,
+        )
+        u, dist_est = _compute_control_command(
+            controller_kind=controller_kind,
+            qd=qd,
+            q=q_ctrl,
+            w=w_ctrl,
+            Kp=Kp,
+            Kd=Kd,
+            adrc_controller=adrc_controller,
+            dt=dt,
+            u_prev=u_prev,
+        )
 
-        # 在线惯量辨识接口：先更新 J，再同步给动力学模型与 ADRC 的 b0
-        if inertia_scheme == 'RLS' and inertia_identifier is not None and k >= inertia_warmup_steps:
-            J_diag_est, inertia_updated = inertia_identifier.update(
-                omega=w_filt,
-                wdot=wdot_est,
-                u=u_prev,
-                disturbance_torque=dist_torque_est,
-            )
-            current_J_diag = _sync_inertia_estimate(J_diag_est, adrc_controller)
-            regressor_min_sv = inertia_identifier.get_last_regressor_min_sv()
-        elif inertia_scheme == 'RLS' and inertia_identifier is not None:
-            current_J_diag = _sync_inertia_estimate(inertia_identifier.get_inertia_diag(), adrc_controller)
-            inertia_updated = False
-            regressor_min_sv = inertia_identifier.get_last_regressor_min_sv()
-        elif inertia_scheme == 'MEKF' and use_augmented_mekf:
-            inertia_updated = (
-                mekf.update_dynamics(wdot_est, disturbance_torque=dist_torque_est)
-                if k >= inertia_warmup_steps else False
-            )
-            current_J_diag = _sync_inertia_estimate(mekf.get_inertia_diag(), adrc_controller)
-            regressor_min_sv = np.nan
-        elif inertia_scheme == 'MEKF' and inertia_identifier is not None:
-            current_J_diag = _sync_inertia_estimate(mekf.get_inertia_diag(), adrc_controller)
-            inertia_updated = False
-            regressor_min_sv = np.nan
-        else:
-            current_J_diag = nominal_J_diag
-            inertia_updated = False
-            regressor_min_sv = np.nan
-        
-        # 控制器计算（先使用真实姿态 q 做控制，验证控制器极限性能）
-        if controller_kind == 'ADRC':
-            u, q_e = adrc_torque(qd, q, w, adrc_controller, dt, u_prev)
-            # 为和动力学中的 dist（力矩）同量纲，使用等效力矩形式的扰动估计
-            dist_est = adrc_controller.get_disturbance_estimate_torque()
-        else:
-            u, q_e = pd_torque(qd, q, w, Kp, Kd)
-            dist_est = np.zeros(3, dtype=float)
+        if inertia_identifier is not None:
+            u = u + _compute_identification_probe_torque(t, estimator_cfg, umax)
         
         # 外部扰动：常值 + 随机白噪声
         dist = dist_const + dist_noise_std * dist_noise_samples[k]
+        u_sat = np.clip(u, -sc.umax, sc.umax)
+        q0_abs = min(1.0, max(0.0, float(abs(q[0]))))
+        err_deg = np.rad2deg(2.0 * np.arccos(q0_abs))
+
+        _record_simulation_sample(
+            history=history,
+            step_idx=k,
+            t=t,
+            q=q,
+            q_est=mekf.q,
+            w=w,
+            u_sat=u_sat,
+            err_deg=err_deg,
+            dist_true=dist,
+            dist_est=dist_est,
+            gyro_bias_true=true_bias,
+            gyro_bias_est=mekf.b,
+            current_J_diag=current_J_diag,
+            inertia_updated=inertia_updated,
+            wdot_est=wdot_est,
+            regressor_min_sv=regressor_min_sv,
+            axis_regressor_norms=axis_regressor_norms,
+        )
+        
+        # 统计饱和次数（按任一轴达到限幅计）。
+        if np.any(np.abs(u_sat) >= (umax - 1e-6)):
+            sat_count += 1
         
         # 动力学积分
-        q, w, u_sat = sc.step(q, w, u, dt, dist=dist)
+        q, w, _ = sc.step(q, w, u, dt, dist=dist)
         
         # 更新上一时刻控制量（用于ADRC）
         u_prev = u_sat.copy()
-        
-        # 记录数据
-        q_true_hist[k] = q
-        q_est_hist[k] = mekf.q
-        w_hist[k] = w
-        u_hist[k] = u_sat
-        dist_true_hist[k] = dist
-        dist_est_hist[k] = dist_est
-        gyro_bias_est_hist[k] = mekf.b
-        inertia_est_hist[k] = current_J_diag
-        inertia_update_mask_hist[k] = 1.0 if inertia_updated else 0.0
-        wdot_est_hist[k] = wdot_est
-        regressor_min_sv_hist[k] = regressor_min_sv
-        
-        # 计算姿态误差（使用真实姿态与期望姿态之间的误差，作为控制性能指标）
-        # 目标姿态固定为单位四元数时，可直接由标量部得到姿态角误差。
-        q0_abs = min(1.0, max(0.0, float(abs(q[0]))))
-        err_hist[k] = np.rad2deg(2.0 * np.arccos(q0_abs))
-        
-        # 统计饱和次数
-        if np.any(np.abs(u_sat) >= (umax - 1e-6)):
-            sat_count += 1
     
     # 改进性能指标计算
     # 修复: settle_time判断逻辑 - 多级阈值法，提高算法间的性能差异
-    settle_time = _compute_settle_time(err_hist, t_hist)
+    settle_time = _compute_settle_time(history['err'], history['t'])
     results = _assemble_simulation_results(
         history=history,
         dist_const=dist_const,
@@ -1503,6 +2126,7 @@ def simulate_attitude_control(Kp=1.0, Kd=0.1,
         Kp=Kp,
         Kd=Kd,
         inertia_scheme=inertia_scheme,
+        control_feedback_source=control_feedback_source,
         inertia_reference=inertia_reference,
         regressor_min_sv_reference=regressor_min_sv_reference,
     )
@@ -1614,12 +2238,26 @@ def _summarize_identified_inertia_result(result, smoothing_ratio=0.12, min_windo
 
     update_mask = np.asarray(result.get('inertia_update_mask', []), dtype=float)
     update_ratio = float(np.mean(update_mask > 0.5) * 100.0) if update_mask.size else 0.0
+    axis_regressor_norms = np.asarray(result.get('axis_regressor_norms', np.full((inertia_hist.shape[0], 3), np.nan)), dtype=float)
+    finite_axis_mask = np.all(np.isfinite(axis_regressor_norms), axis=1)
+    if axis_regressor_norms.ndim == 2 and axis_regressor_norms.shape[1] == 3 and np.any(finite_axis_mask):
+        mean_axis_regressor_norms = np.mean(axis_regressor_norms[finite_axis_mask], axis=0)
+        max_axis_norm = float(np.max(mean_axis_regressor_norms))
+        excitation_balance = (
+            float(np.min(mean_axis_regressor_norms) / max(max_axis_norm, 1e-12))
+            if max_axis_norm > 0.0 else 0.0
+        )
+    else:
+        mean_axis_regressor_norms = np.full(3, np.nan, dtype=float)
+        excitation_balance = np.nan
 
     summary = {
         'inertia': final_inertia,
         'stability_norm': stability_norm,
         'update_ratio': update_ratio,
         'tail_window': int(window),
+        'mean_axis_regressor_norms': mean_axis_regressor_norms,
+        'excitation_balance': excitation_balance,
     }
 
     if result.get('inertia_reference') is not None:
@@ -1629,6 +2267,162 @@ def _summarize_identified_inertia_result(result, smoothing_ratio=0.12, min_windo
     return summary
 
 
+def _resolve_validation_seeds(validation_seed, validation_runs):
+    """
+    将惯量候选验证的随机种子统一展开为整数列表。
+    """
+    runs = max(1, int(validation_runs))
+    if np.isscalar(validation_seed):
+        seed0 = int(validation_seed)
+        return [seed0 + i for i in range(runs)]
+
+    seeds = [int(seed) for seed in validation_seed]
+    if not seeds:
+        return [0]
+    return seeds[:runs]
+
+
+def _build_identification_selection_candidates(identification_results, fallback):
+    """
+    构造用于后续控制配置选择的惯量候选集合。
+    """
+    candidates = []
+    for scheme_name, result in identification_results.items():
+        summary = _summarize_identified_inertia_result(result)
+        if summary is None:
+            continue
+        summary = dict(summary)
+        summary.update({
+            'scheme': str(scheme_name).upper(),
+            'selection_origin': 'identified',
+        })
+        candidates.append(summary)
+
+    if len(candidates) >= 2:
+        fused_inertia = ensure_diag_inertia(
+            np.median([item['inertia'] for item in candidates], axis=0)
+        )
+        fused_update_ratio = float(np.mean([item['update_ratio'] for item in candidates]))
+        fused_stability = float(np.mean([item['stability_norm'] for item in candidates]))
+        fused_tail_window = int(max(item['tail_window'] for item in candidates))
+        candidates.append({
+            'scheme': 'FUSED',
+            'selection_origin': 'fused',
+            'inertia': fused_inertia,
+            'update_ratio': fused_update_ratio,
+            'stability_norm': fused_stability,
+            'tail_window': fused_tail_window,
+            'excitation_balance': float(np.nanmean([item.get('excitation_balance', np.nan) for item in candidates])),
+            'mean_axis_regressor_norms': np.nanmean(
+                [item.get('mean_axis_regressor_norms', np.full(3, np.nan, dtype=float)) for item in candidates],
+                axis=0,
+            ),
+            'source_schemes': [item['scheme'] for item in candidates if item.get('selection_origin') == 'identified'],
+        })
+
+    candidates.append({
+        'scheme': 'NOMINAL',
+        'selection_origin': 'fallback',
+        'inertia': ensure_diag_inertia(fallback),
+        'update_ratio': 0.0,
+        'stability_norm': 0.0,
+        'tail_window': 0,
+        'excitation_balance': np.nan,
+        'mean_axis_regressor_norms': np.full(3, np.nan, dtype=float),
+        'source_schemes': [],
+    })
+    return candidates
+
+
+def _evaluate_identified_inertia_candidate(
+    candidate,
+    dt,
+    umax,
+    true_inertia,
+    validation_seeds,
+    validation_T,
+    use_star_tracker,
+    excitation_profile,
+):
+    """
+    对单个惯量候选做短时闭环鲁棒性验证。
+    """
+    candidate_inertia = ensure_diag_inertia(candidate['inertia'])
+    max_omega_o = min(12.0, 0.49 / max(float(dt), 1e-6))
+    validation_omega_c = min(4.5, 0.4 * max_omega_o)
+    validation_omega_o = min(max_omega_o, max(2.2 * validation_omega_c, validation_omega_c + 2.0))
+    adrc_params = _build_default_adrc_params(
+        dt=dt,
+        estimated_inertia=candidate_inertia,
+        omega_c=validation_omega_c,
+        omega_o=validation_omega_o,
+    )
+
+    validation_runs = []
+    for seed in validation_seeds:
+        validation_results = simulate_attitude_control(
+            T=max(8.0, float(validation_T)),
+            dt=dt,
+            umax=umax,
+            use_star_tracker=use_star_tracker,
+            show_plots=False,
+            controller_type='ADRC',
+            adrc_params=adrc_params,
+            seed=int(seed),
+            excitation_profile=excitation_profile,
+            true_inertia=true_inertia,
+            verbose=False,
+        )
+        validation_runs.append({
+            'seed': int(seed),
+            'score': float(_score_adrc_results(validation_results)),
+            'settle_time': float(validation_results['settle_time']),
+            'final_error': float(validation_results['final_error']),
+            'overshoot': float(validation_results['overshoot']),
+            'effort': float(validation_results['effort']),
+        })
+
+    score_arr = np.array([item['score'] for item in validation_runs], dtype=float)
+    settle_arr = np.array([item['settle_time'] for item in validation_runs], dtype=float)
+    final_err_arr = np.array([item['final_error'] for item in validation_runs], dtype=float)
+    overshoot_arr = np.array([item['overshoot'] for item in validation_runs], dtype=float)
+    effort_arr = np.array([item['effort'] for item in validation_runs], dtype=float)
+
+    update_penalty = 0.02 * max(0.0, 10.0 - float(candidate.get('update_ratio', 0.0)))
+    stability_penalty = 25.0 * float(candidate.get('stability_norm', 0.0))
+    robustness_penalty = 0.35 * float(np.std(score_arr))
+    excitation_balance = candidate.get('excitation_balance', np.nan)
+    excitation_penalty = (
+        0.45 * max(0.0, 0.22 - float(excitation_balance))
+        if np.isfinite(excitation_balance) else 0.0
+    )
+    fallback_penalty = 0.30 if str(candidate.get('selection_origin', 'identified')) == 'fallback' else 0.0
+    model_score = float(
+        np.mean(score_arr)
+        + robustness_penalty
+        + update_penalty
+        + stability_penalty
+        + excitation_penalty
+        + fallback_penalty
+    )
+
+    evaluated = dict(candidate)
+    evaluated.update({
+        'validation_score': float(np.mean(score_arr)),
+        'validation_score_std': float(np.std(score_arr)),
+        'validation_score_best': float(np.min(score_arr)),
+        'validation_settle_time': float(np.mean(settle_arr)),
+        'validation_final_error': float(np.mean(final_err_arr)),
+        'validation_overshoot': float(np.mean(overshoot_arr)),
+        'validation_effort': float(np.mean(effort_arr)),
+        'validation_runs': validation_runs,
+        'validation_seed_count': int(len(validation_runs)),
+        'excitation_penalty': float(excitation_penalty),
+        'model_score': model_score,
+    })
+    return evaluated
+
+
 def _select_identified_inertia(
     identification_results,
     dt,
@@ -1636,6 +2430,7 @@ def _select_identified_inertia(
     fallback_inertia=None,
     true_inertia=None,
     validation_seed=0,
+    validation_runs=3,
     validation_T=10.0,
     use_star_tracker=False,
     excitation_profile='aggressive',
@@ -1649,7 +2444,7 @@ def _select_identified_inertia(
     3. 结合闭环验证分数、尾段稳定性与更新占比，自动选择更稳妥的模型
     """
     if fallback_inertia is None:
-        fallback = np.array([0.05, 0.05, 0.05], dtype=float)
+        fallback = np.array([0.50, 0.50, 0.50], dtype=float)
     else:
         fallback = ensure_diag_inertia(fallback_inertia)
 
@@ -1663,55 +2458,21 @@ def _select_identified_inertia(
             'selection_reason': 'no_identification_results',
         }
 
+    validation_seeds = _resolve_validation_seeds(validation_seed, validation_runs)
     candidate_rows = []
-    max_omega_o = min(12.0, 0.49 / max(float(dt), 1e-6))
-    validation_omega_c = min(4.5, 0.4 * max_omega_o)
-    validation_omega_o = min(max_omega_o, max(2.2 * validation_omega_c, validation_omega_c + 2.0))
-
-    for scheme_name, result in identification_results.items():
-        summary = _summarize_identified_inertia_result(result)
-        if summary is None:
-            continue
-
-        candidate_inertia = summary['inertia']
-        adrc_params = _build_default_adrc_params(
-            dt=dt,
-            estimated_inertia=candidate_inertia,
-            omega_c=validation_omega_c,
-            omega_o=validation_omega_o,
+    for candidate in _build_identification_selection_candidates(identification_results, fallback):
+        candidate_rows.append(
+            _evaluate_identified_inertia_candidate(
+                candidate,
+                dt=dt,
+                umax=umax,
+                true_inertia=true_inertia,
+                validation_seeds=validation_seeds,
+                validation_T=validation_T,
+                use_star_tracker=use_star_tracker,
+                excitation_profile=excitation_profile,
+            )
         )
-        validation_results = simulate_attitude_control(
-            T=max(8.0, float(validation_T)),
-            dt=dt,
-            umax=umax,
-            use_star_tracker=use_star_tracker,
-            show_plots=False,
-            controller_type='ADRC',
-            adrc_params=adrc_params,
-            seed=validation_seed,
-            excitation_profile=excitation_profile,
-            true_inertia=true_inertia,
-            verbose=False,
-        )
-        validation_score = _score_adrc_results(validation_results)
-        update_penalty = 0.02 * max(0.0, 10.0 - summary['update_ratio'])
-        stability_penalty = 25.0 * summary['stability_norm']
-        model_score = float(validation_score + update_penalty + stability_penalty)
-
-        candidate_rows.append({
-            'scheme': str(scheme_name).upper(),
-            'inertia': candidate_inertia,
-            'update_ratio': summary['update_ratio'],
-            'stability_norm': summary['stability_norm'],
-            'tail_window': summary['tail_window'],
-            'reference_error_norm': summary.get('reference_error_norm'),
-            'validation_score': validation_score,
-            'validation_settle_time': float(validation_results['settle_time']),
-            'validation_final_error': float(validation_results['final_error']),
-            'validation_overshoot': float(validation_results['overshoot']),
-            'validation_effort': float(validation_results['effort']),
-            'model_score': model_score,
-        })
 
     if not candidate_rows:
         return {
@@ -1802,6 +2563,7 @@ def compare_pd_gain_optimizers(
     lo = np.array(bounds[0], dtype=float)
     hi = np.array(bounds[1], dtype=float)
     cache = {}
+    full_result_cache = {}
     oob_penalty_scale = 1e5  # 边界越界惩罚系数（与越界距离线性相关）
     out_dir = PROJECT_OUTPUT_DIR if output_dir is None else Path(output_dir)
     if objective_eval_seeds is None:
@@ -1812,8 +2574,27 @@ def compare_pd_gain_optimizers(
         eval_seeds = [int(seed)]
     risk_aversion = 0.35
     tail_weight = 0.15
+    need_full_results = bool(show_plots or save_plots)
     if save_plots:
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    sim_cfg_full = dict(sim_cfg)
+    sim_cfg_full['show_plots'] = False
+    sim_cfg_full['result_mode'] = 'full'
+
+    def fetch_full_results(Kp, Kd, sim_seed):
+        """为少量入选参数补跑完整时序结果，用于论文风格图像输出。"""
+        key = (round(float(Kp), 8), round(float(Kd), 8), int(sim_seed))
+        if key not in full_result_cache:
+            full_result_cache[key] = simulate_attitude_control(
+                Kp=float(Kp),
+                Kd=float(Kd),
+                controller_type='PD',
+                seed=int(sim_seed),
+                verbose=False,
+                **sim_cfg_full,
+            )
+        return full_result_cache[key]
 
     def objective(x):
         """目标函数（固定随机种子 + 越界惩罚）。"""
@@ -1935,6 +2716,9 @@ def compare_pd_gain_optimizers(
             rec = cache[(round(float(x_best[0]), 8), round(float(x_best[1]), 8))]
             if rec['results'] is None or not np.isfinite(rec['settle_time']):
                 continue
+            representative_results = rec['results']
+            if need_full_results and (representative_results is None or 't' not in representative_results):
+                representative_results = fetch_full_results(rec['Kp'], rec['Kd'], eval_seeds[0])
             run_records.append({
                 'Kp': float(rec['Kp']),
                 'Kd': float(rec['Kd']),
@@ -1948,7 +2732,7 @@ def compare_pd_gain_optimizers(
                 'effort': float(rec['effort']),
                 'sat_ratio': float(rec['sat_ratio']),
                 'history': _best_so_far(hist),
-                'results': rec['results'],
+                'results': representative_results if need_full_results else None,
             })
 
         if not run_records:
@@ -2098,6 +2882,44 @@ def compare_pd_gain_optimizers(
             _save_figure(fig_report, out_dir / "pd_optimizer_report_dashboard.png")
         elif fig_report is not None:
             plt.close(fig_report)
+
+        fig_convergence = plot_optimizer_convergence_statistics(
+            method_run_data,
+            comparison,
+            title=f'优化器收敛统计曲线（均值±标准差，n={run_count}）',
+        )
+        if fig_convergence is not None and save_plots:
+            _save_figure(fig_convergence, out_dir / "pd_optimizer_convergence_statistics.png")
+        elif fig_convergence is not None:
+            plt.close(fig_convergence)
+
+        fig_response = plot_optimizer_best_response_dashboard(
+            method_run_data,
+            comparison,
+            title='不同优化器最优增益下的闭环响应对比',
+        )
+        if fig_response is not None and save_plots:
+            _save_figure(fig_response, out_dir / "pd_optimizer_best_response_dashboard.png")
+        elif fig_response is not None:
+            plt.close(fig_response)
+
+        fig_tradeoff = plot_optimizer_tradeoff_scatter(
+            comparison,
+            title='优化器精度-能耗权衡图',
+        )
+        if fig_tradeoff is not None and save_plots:
+            _save_figure(fig_tradeoff, out_dir / "pd_optimizer_tradeoff_scatter.png")
+        elif fig_tradeoff is not None:
+            plt.close(fig_tradeoff)
+
+        fig_heatmap = plot_optimizer_metric_heatmap(
+            comparison,
+            title='优化器指标热力图（列内归一化）',
+        )
+        if fig_heatmap is not None and save_plots:
+            _save_figure(fig_heatmap, out_dir / "pd_optimizer_metric_heatmap.png")
+        elif fig_heatmap is not None:
+            plt.close(fig_heatmap)
 
 
     return {
@@ -2317,24 +3139,24 @@ def main(profile='full'):
     T = run_profile['T']
     dt = run_profile['dt']
     umax = 0.5  # 最大控制力矩 (N·m)
-    true_inertia_diag = np.array([0.16, 0.14, 0.10], dtype=float)
+    true_inertia_diag = np.array([1.60, 1.40, 1.00], dtype=float)
 
-    print(f"\n共同仿真参数:")
+    print("\n共同仿真参数:")
     print(f"  运行档位 profile = {run_profile['profile']}")
     print(f"  仿真时间 T = {T} s")
     print(f"  时间步长 dt = {dt} s")
     print(f"  最大力矩 umax = {umax} N·m")
-    print(f"  真实惯量 J = {true_inertia_diag} kg·m²")
+    print(f"  真实惯量 J = {true_inertia_diag} kg*m^2")
     output_layout = _make_output_layout(PROJECT_OUTPUT_DIR)
     output_dir = output_layout['root']
 
     # ====== 前置动力学参数辨识 ======
-    identification_results = _run_inertia_identification_cases(run_profile, umax, output_layout)
+    identification_results = _run_inertia_identification_cases(run_profile, umax, output_layout, true_inertia_diag)
     selected_inertia_summary = _select_identified_inertia(
         identification_results,
         dt=dt,
         umax=umax,
-        fallback_inertia=true_inertia_diag,
+        fallback_inertia=np.diag(np.asarray(CONFIG['spacecraft']['inertia'], dtype=float)),
         true_inertia=true_inertia_diag,
         validation_seed=run_profile['objective_eval_seeds'][0] if run_profile.get('objective_eval_seeds') else 0,
         validation_T=max(8.0, float(run_profile['T'])),
@@ -2451,9 +3273,11 @@ def main(profile='full'):
     _print_controller_comparison(results_pd, results_adrc)
     
     # ====== 绘制对比图 ======
+    _save_controller_comparison_summary(results_pd, results_adrc, output_layout['comparison'])
     if run_profile['save_comparison_plots']:
         _save_controller_comparison_plots(results_pd, results_adrc, umax, output_layout['comparison'])
     else:
+        _remove_comparison_plot_files(output_layout['comparison'])
         print("\n快速模式已启用：跳过对比图生成。")
 
     report_path = _generate_markdown_report(

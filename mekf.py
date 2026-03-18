@@ -5,13 +5,8 @@ MEKF (Multiplicative Extended Kalman Filter) 模块
 
 import numpy as np
 from core_utils import (
-    quat_conjugate,
     quat_from_omega,
     quat_mul,
-    quat_multiply,
-    quat_normalize,
-    quat_to_small_angle,
-    small_angle_quat,
 )
 from estimators import ensure_diag_inertia, diagonal_inertia_wdot_jacobian
 
@@ -241,7 +236,7 @@ class MEKF_Augmented(MEKFBiasOnly):
     ):
         self.inertia_bounds = (float(inertia_bounds[0]), float(inertia_bounds[1]))
         self.J_diag = ensure_diag_inertia(
-            np.array([0.08, 0.07, 0.05], dtype=float) if J0 is None else J0,
+            np.array([0.80, 0.70, 0.50], dtype=float) if J0 is None else J0,
             min_inertia=self.inertia_bounds[0],
         )
         self.last_u_applied = np.zeros(3, dtype=float)
@@ -292,10 +287,6 @@ class MEKF_Augmented(MEKFBiasOnly):
     def get_inertia_diag(self):
         """返回当前估计的对角惯量。"""
         return self.J_diag.copy()
-
-    def get_inertia_matrix(self):
-        """返回当前估计的惯量矩阵。"""
-        return np.diag(self.J_diag)
 
     def _compute_wdot_model(self, omega_corr, torque):
         omega_corr = np.asarray(omega_corr, dtype=float)
@@ -440,72 +431,3 @@ class MEKF_Augmented(MEKFBiasOnly):
         self.last_G_J = G_J
         self.last_dynamics_update_active = True
         return True
-
-
-# 兼容demo2.py的简单MEKF类
-class MEKF:
-    """
-    简化版MEKF（兼容demo2.py）
-    只估计姿态，不估计偏置
-    """
-    
-    def __init__(self, Q_err, R_meas):
-        """
-        初始化MEKF
-        
-        参数:
-            Q_err: 误差过程噪声协方差
-            R_meas: 测量噪声协方差
-        """
-        self.q_est = np.array([1.0, 0.0, 0.0, 0.0])
-        self.P = np.eye(3)
-        self.Q = Q_err
-        self.R = R_meas
-    
-    def predict(self, delta_q_meas):
-        """
-        预测步骤：利用旋转增量更新估计
-        
-        参数:
-            delta_q_meas: 旋转增量四元数
-        """
-        self.q_est = quat_normalize(quat_multiply(self.q_est, delta_q_meas))
-        Phi = np.eye(3)
-        self.P = Phi @ self.P @ Phi.T + self.Q
-    
-    def update(self, q_meas):
-        """
-        更新步骤：使用测量姿态更新估计
-        
-        参数:
-            q_meas: 测量得到的姿态四元数
-        """
-        # 计算误差四元数
-        q_est_inv = quat_conjugate(self.q_est)
-        q_err = quat_multiply(q_meas, q_est_inv)
-        q_err = quat_normalize(q_err)
-        
-        # 转换为小角度向量
-        delta_theta_meas = quat_to_small_angle(q_err)
-        
-        # 卡尔曼滤波更新
-        H = np.eye(3)
-        S = H @ self.P @ H.T + self.R
-        PHt = self.P @ H.T
-        K = np.linalg.solve(S.T, PHt.T).T
-        
-        # 更新协方差
-        self.P = (np.eye(3) - K @ H) @ self.P
-        
-        # 更新姿态估计
-        delta_theta_update = K @ delta_theta_meas
-        delta_q_update = small_angle_quat(delta_theta_update)
-        self.q_est = quat_normalize(quat_multiply(delta_q_update, self.q_est))
-    
-    def get_estimate(self):
-        """获取当前姿态估计"""
-        return self.q_est
-    
-    def get_covariance(self):
-        """获取当前协方差矩阵"""
-        return self.P

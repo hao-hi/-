@@ -40,7 +40,7 @@ class ADRCController:
     ):
         """
         参数:
-            b0: 控制增益，可为标量或长度3向量。默认按 J=diag([0.08,0.08,0.08]) 取 1/J。
+            b0: 控制增益，可为标量或长度3向量。默认按 J=diag([0.8,0.8,0.8]) 取 1/J。
             omega_c: 控制器带宽(rad/s)，用于 Kp=omega_c^2, Kd=2*omega_c。
             omega_o: ESO带宽(rad/s)，用于 beta1/2/3。
             wc: 兼容旧参数，等价于 omega_c。
@@ -96,7 +96,7 @@ class ADRCController:
 
         # b0 支持标量 / 三轴向量
         if b0 is None:
-            self.b0 = np.full(3, 1.0 / 0.08, dtype=float)
+            self.b0 = np.full(3, 1.0 / 0.8, dtype=float)
         else:
             self.b0 = self._vec3(b0)
         self.b0 = np.maximum(self.b0, 1e-6)

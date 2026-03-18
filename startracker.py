@@ -31,7 +31,7 @@ def wahba_attitude(obs_cam, ref_inertial, w=None):
 class StarTracker:
     """星敏感器模型"""
     
-    def __init__(self, n_stars_catalog=2000, fov_deg=20, dir_noise_std=1e-3):
+    def __init__(self, n_stars_catalog=2000, fov_deg=20, dir_noise_std=1e-3, rng=None):
         """
         初始化星敏感器
         
@@ -39,9 +39,11 @@ class StarTracker:
             n_stars_catalog: 星表大小
             fov_deg: 视场角（度）
             dir_noise_std: 方向测量噪声标准差
+            rng: 随机数发生器，默认使用 numpy 全局随机源
         """
+        self.rng = np.random if rng is None else rng
         # 生成随机星表（单位矢量）
-        self.catalog = rand_unit(n_stars_catalog)
+        self.catalog = rand_unit(n_stars_catalog, rng=self.rng)
         self.fov = np.deg2rad(fov_deg)
         self.cos_fov = np.cos(self.fov)
         self.noise = dir_noise_std
@@ -70,7 +72,7 @@ class StarTracker:
         V = visible_catalog @ R_inertial_to_cam.T
         
         # 添加测量噪声
-        Vn = V + self.noise * np.random.randn(*V.shape)
+        Vn = V + self.noise * self.rng.randn(*V.shape)
         Vn = Vn / np.linalg.norm(Vn, axis=1, keepdims=True)
         
         # 选择最亮的20颗星（按z坐标排序，z越大越接近光轴中心）

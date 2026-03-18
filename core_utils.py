@@ -6,7 +6,11 @@
 
 import numpy as np
 try:
-    from numba import jit
+    from numba import jit as _numba_jit
+
+    def jit(*args, **kwargs):
+        kwargs.setdefault("cache", True)
+        return _numba_jit(*args, **kwargs)
 except Exception:
     def jit(*args, **kwargs):
         def decorator(func):
@@ -45,24 +49,6 @@ def quat_norm(q):
     if norm < 1e-15:
         return qf.copy()
     return qf / norm
-
-
-def quat_normalize(q):
-    """四元数归一化（别名）"""
-    norm = np.linalg.norm(q)
-    if norm == 0:
-        return q
-    return q / norm
-
-
-def quat_multiply(q1, q2):
-    """四元数乘法（别名）"""
-    return quat_mul(q1, q2)
-
-
-def quat_conjugate(q):
-    """四元数共轭（与quat_inv类似，但假设单位四元数）"""
-    return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
 @jit(nopython=True)
@@ -131,13 +117,6 @@ def R_to_quat(R):
 
 
 @jit(nopython=True)
-def skew(v):
-    """向量转反对称矩阵"""
-    x, y, z = v
-    return np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
-
-
-@jit(nopython=True)
 def omega_mat(w):
     """角速度矩阵（用于四元数微分方程）"""
     wx, wy, wz = w
@@ -147,33 +126,6 @@ def omega_mat(w):
         [wy, -wz, 0, wx],
         [wz, wy, -wx, 0]
     ])
-
-
-@jit(nopython=True)
-def integrate_attitude(q, w, dt):
-    """姿态积分（使用四元数微分方程）"""
-    dq = (0.5 * omega_mat(w) @ q) * dt
-    qn = q + dq
-    return quat_norm(qn)
-
-
-def small_angle_quat(delta_theta):
-    """小角度旋转向量转四元数"""
-    theta = np.linalg.norm(delta_theta)
-    if theta < 1e-8:
-        return np.array([1.0, delta_theta[0]/2, delta_theta[1]/2, delta_theta[2]/2])
-    axis = delta_theta / theta
-    q0 = np.cos(theta / 2.0)
-    qv = axis * np.sin(theta / 2.0)
-    return np.concatenate(([q0], qv))
-
-
-def quat_to_small_angle(q_err):
-    """误差四元数转小角度向量"""
-    if q_err[0] < 0.0:
-        q_err = -q_err
-    return 2.0 * q_err[1:4]
-
 
 @jit(nopython=True)
 def quat_from_omega(w, dt):
@@ -201,30 +153,6 @@ def quat_error(qd, q):
     return q_e
 
 
-@jit(nopython=True)
-def ang_between_R(Ra, Rb):
-    """计算两个旋转矩阵之间的角度"""
-    Rt = Ra @ Rb.T
-    c = (np.trace(Rt) - 1.0) / 2.0
-    if c > 1.0:
-        c = 1.0
-    elif c < -1.0:
-        c = -1.0
-    a = np.arccos(c)
-    return a
-
-
-def quat_angle_error_rad(q_ref, q):
-    """
-    直接由四元数内积计算姿态角误差，避免重复转旋转矩阵。
-    """
-    q_ref_n = quat_normalize(np.asarray(q_ref, dtype=float))
-    q_n = quat_normalize(np.asarray(q, dtype=float))
-    dot_val = float(np.abs(np.dot(q_ref_n, q_n)))
-    dot_val = min(1.0, max(-1.0, dot_val))
-    return 2.0 * np.arccos(dot_val)
-
-
 def quat_angle_errors_deg(q_ref_seq, q_seq):
     """
     批量计算四元数序列之间的姿态角误差（单位：度）。
@@ -244,8 +172,9 @@ def quat_angle_errors_deg(q_ref_seq, q_seq):
     return np.rad2deg(2.0 * np.arccos(dots))
 
 
-def rand_unit(n):
+def rand_unit(n, rng=None):
     """生成 n 个随机单位向量。"""
-    v = np.random.randn(n, 3)
+    randn = np.random.randn if rng is None else rng.randn
+    v = randn(n, 3)
     v /= np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
     return v

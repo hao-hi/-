@@ -5,7 +5,7 @@ import numpy as np
 
 CONFIG = {
     'spacecraft': {
-        'inertia': np.diag([0.08, 0.07, 0.05]),  # kg·m²，转动惯量矩阵
+        'inertia': np.diag([0.80, 0.70, 0.50]),  # kg·m²，转动惯量矩阵
         'u_max': 0.2,  # N·m，控制力矩饱和限制
         'disturbance': {
             'constant': np.array([0.001, 0.001, 0.001]),  # N·m，常值扰动
@@ -17,7 +17,7 @@ CONFIG = {
         'dt': 0.03,  # s，时间步长
         'seed': 0,  # 随机种子
         'initial_conditions': {
-            'q0': np.array([0.0, 0.0, 0.0, 1.0]),  # 初始姿态四元数
+            'q0': np.array([1.0, 0.0, 0.0, 0.0]),  # 初始姿态四元数（标量在前的单位四元数）
             'w0': np.array([0.1, 0.1, 0.1]),  # rad/s，初始角速度
         }
     },
